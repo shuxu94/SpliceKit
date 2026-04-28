@@ -17,10 +17,15 @@
 				<li>27th April 2026</li>
 			</ul>
 
-			<h2>🔨 Improvements</h2>
-
+			<h2>🐞 Bug Fixes</h2>
 			<ul>
-				<li>Crash fixes from Sentry triage: silences false-positive &#x27;FCP terminated shortly after launch&#x27; Sentry events on normal user quits; suppresses Xcode CLT prereq from crash dashboards; ships whisper-transcriber so the Whisper large-v3 / large-v3-turbo engines in the social captions panel actually work; hardens NSTask termination handling in transcript/caption transcription paths; fixes a playhead-overlay UAF during timeline teardown; rejects malformed RPC params instead of crashing; fixes a string-argument crash in system.callMethodWithArgs.</li>
+				<li>Crash fixes from Sentry triage: silences false-positive &#x27;FCP terminated shortly after launch&#x27; Sentry events on normal user quits.</li>
+				<li>Suppresses Xcode CLT prereq from crash dashboards.</li>
+				<li>Ships <code>whisper-transcriber</code> so the Whisper <code>large-v3</code> / <code>large-v3-turbo</code> engines in the social captions panel actually work.</li>
+				<li>Hardens <code>NSTask</code> termination handling in transcript/caption transcription paths.</li>
+				<li>Fixes a playhead-overlay <code>UAF</code> during timeline teardown.</li>
+				<li>Rejects malformed <code>RPC</code> params instead of crashing.</li>
+				<li>Fixes a string-argument crash in <code>system.callMethodWithArgs</code>.</li>
 			</ul>
 
 			<hr />
