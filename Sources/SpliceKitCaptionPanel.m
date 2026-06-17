@@ -2267,6 +2267,218 @@ static void SpliceKit_installDragSpy(void) {
     return [clipInfos copy];
 }
 
+#pragma mark - Persistent Whisper serve helper
+
+// Keeps a single `whisper-transcriber --serve` process alive for the FCP session
+// so the CoreML/ANE model is loaded and specialized exactly once, instead of on
+// every transcription (each fresh subprocess otherwise re-ran the expensive
+// "Compiling CoreML models for your device..." step). Requests are manifest
+// paths sent over stdin; each response is a single JSON line on stdout. Progress
+// and a READY marker arrive on stderr.
+static NSLock *sWhisperServeLock = nil;
+static NSTask *sWhisperServeTask = nil;
+static NSPipe *sWhisperServeStdin = nil;
+static NSPipe *sWhisperServeStdout = nil;
+static NSPipe *sWhisperServeStderr = nil;
+static NSString *sWhisperServeModel = nil;
+static NSString *sWhisperServeBinary = nil;
+static NSMutableData *sWhisperServeStdoutAccum = nil;
+static NSMutableData *sWhisperServeStderrAccum = nil;
+static dispatch_semaphore_t sWhisperServeResponseSem = nil;
+static dispatch_semaphore_t sWhisperServeReadySem = nil;
+static NSData *sWhisperServeResponseLine = nil;
+static BOOL sWhisperServeReady = NO;
+static void (^sWhisperServeProgress)(double, NSString *) = nil;
+
+// Environment for transcriber subprocesses: inherit FCP's environment but strip
+// DYLD_INSERT_LIBRARIES so the SpliceKit dylib doesn't inject into these plain
+// CLIs (its constructor — Sentry, CloudContent guard, etc. — just adds noise and
+// startup cost, and reports the child as "SpliceKit initializing").
+static NSDictionary *SpliceKitTranscriber_childEnvironment(void) {
+    NSMutableDictionary *env = [[[NSProcessInfo processInfo] environment] mutableCopy];
+    [env removeObjectForKey:@"DYLD_INSERT_LIBRARIES"];
+    [env removeObjectForKey:@"DYLD_FORCE_FLAT_NAMESPACE"];
+    return env;
+}
+
+static void SpliceKitWhisperServe_teardown(void) {
+    if (sWhisperServeTask) {
+        if (sWhisperServeTask.isRunning) {
+            @try { [sWhisperServeStdin.fileHandleForWriting writeData:[@"__QUIT__\n" dataUsingEncoding:NSUTF8StringEncoding]]; } @catch (__unused NSException *e) {}
+            @try { [sWhisperServeTask terminate]; } @catch (__unused NSException *e) {}
+        }
+    }
+    sWhisperServeStdout.fileHandleForReading.readabilityHandler = nil;
+    sWhisperServeStderr.fileHandleForReading.readabilityHandler = nil;
+    sWhisperServeTask = nil;
+    sWhisperServeStdin = nil;
+    sWhisperServeStdout = nil;
+    sWhisperServeStderr = nil;
+    sWhisperServeModel = nil;
+    sWhisperServeBinary = nil;
+    sWhisperServeReady = NO;
+}
+
+// Launch (or relaunch) the serve process for binary+model. Caller holds the lock.
+static BOOL SpliceKitWhisperServe_ensureRunning(NSString *binaryPath, NSString *modelArg, NSString *engineLabel) {
+    BOOL alive = (sWhisperServeTask && sWhisperServeTask.isRunning);
+    BOOL sameConfig = ([sWhisperServeModel isEqualToString:modelArg] && [sWhisperServeBinary isEqualToString:binaryPath]);
+    if (alive && sameConfig && sWhisperServeReady) return YES;
+
+    SpliceKitWhisperServe_teardown();
+
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = binaryPath;
+    task.arguments = @[@"--serve", @"--model", modelArg, @"--progress"];
+    task.environment = SpliceKitTranscriber_childEnvironment();
+    sWhisperServeStdin = [NSPipe pipe];
+    sWhisperServeStdout = [NSPipe pipe];
+    sWhisperServeStderr = [NSPipe pipe];
+    task.standardInput = sWhisperServeStdin;
+    task.standardOutput = sWhisperServeStdout;
+    task.standardError = sWhisperServeStderr;
+    sWhisperServeStdoutAccum = [NSMutableData data];
+    sWhisperServeStderrAccum = [NSMutableData data];
+    sWhisperServeResponseSem = dispatch_semaphore_create(0);
+    sWhisperServeReadySem = dispatch_semaphore_create(0);
+    sWhisperServeReady = NO;
+    sWhisperServeResponseLine = nil;
+
+    // stdout: each result is "__SK_JSON__<json>\n". Extract the JSON between the
+    // token and the next newline; ignore any other stdout noise (e.g. CoreML E5RT).
+    sWhisperServeStdout.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
+        NSData *data = handle.availableData;
+        if (data.length == 0) return;
+        NSData *tokenData = [@"__SK_JSON__" dataUsingEncoding:NSUTF8StringEncoding];
+        @synchronized (sWhisperServeStdoutAccum) {
+            [sWhisperServeStdoutAccum appendData:data];
+            while (1) {
+                NSRange tr = [sWhisperServeStdoutAccum rangeOfData:tokenData
+                                                          options:0
+                                                            range:NSMakeRange(0, sWhisperServeStdoutAccum.length)];
+                if (tr.location == NSNotFound) {
+                    // No token yet — keep only a small tail so a token split across
+                    // reads survives, and discard accumulated noise.
+                    if (sWhisperServeStdoutAccum.length > 32) {
+                        sWhisperServeStdoutAccum = [[sWhisperServeStdoutAccum
+                            subdataWithRange:NSMakeRange(sWhisperServeStdoutAccum.length - 32, 32)] mutableCopy];
+                    }
+                    break;
+                }
+                NSUInteger jsonStart = tr.location + tr.length;
+                const char *bytes = (const char *)sWhisperServeStdoutAccum.bytes;
+                NSUInteger len = sWhisperServeStdoutAccum.length;
+                NSInteger nl = -1;
+                for (NSUInteger i = jsonStart; i < len; i++) { if (bytes[i] == '\n') { nl = (NSInteger)i; break; } }
+                if (nl < 0) break; // JSON not fully arrived yet
+                NSData *resp = [sWhisperServeStdoutAccum subdataWithRange:NSMakeRange(jsonStart, (NSUInteger)nl - jsonStart)];
+                NSUInteger restOffset = (NSUInteger)nl + 1;
+                NSUInteger restLen = len - restOffset;
+                sWhisperServeStdoutAccum = restLen
+                    ? [[sWhisperServeStdoutAccum subdataWithRange:NSMakeRange(restOffset, restLen)] mutableCopy]
+                    : [NSMutableData data];
+                sWhisperServeResponseLine = resp;
+                dispatch_semaphore_signal(sWhisperServeResponseSem);
+            }
+        }
+    };
+
+    // stderr: READY marker + PROGRESS lines.
+    sWhisperServeStderr.fileHandleForReading.readabilityHandler = ^(NSFileHandle *handle) {
+        NSData *data = handle.availableData;
+        if (data.length == 0) return;
+        @synchronized (sWhisperServeStderrAccum) { [sWhisperServeStderrAccum appendData:data]; }
+        NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (!text) return;
+        for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+            if ([line hasPrefix:@"READY"]) {
+                if (!sWhisperServeReady) { sWhisperServeReady = YES; dispatch_semaphore_signal(sWhisperServeReadySem); }
+            } else if ([line hasPrefix:@"PROGRESS:"]) {
+                NSArray *parts = [line componentsSeparatedByString:@":"];
+                if (parts.count >= 3) {
+                    double frac = [parts[1] doubleValue];
+                    NSString *msg = [[parts subarrayWithRange:NSMakeRange(2, parts.count - 2)] componentsJoinedByString:@":"];
+                    void (^pb)(double, NSString *) = sWhisperServeProgress;
+                    if (pb) pb(frac, msg);
+                }
+            }
+        }
+    };
+
+    // Unblock any waiter if the process dies.
+    task.terminationHandler = ^(__unused NSTask *t) {
+        if (sWhisperServeReadySem) dispatch_semaphore_signal(sWhisperServeReadySem);
+        if (sWhisperServeResponseSem) dispatch_semaphore_signal(sWhisperServeResponseSem);
+    };
+
+    @try {
+        [task launch];
+    } @catch (NSException *e) {
+        SpliceKit_log(@"[Captions] Failed to launch %@ serve helper: %@", engineLabel, e.reason);
+        SpliceKitWhisperServe_teardown();
+        return NO;
+    }
+    sWhisperServeTask = task;
+    sWhisperServeModel = modelArg;
+    sWhisperServeBinary = binaryPath;
+    SpliceKit_log(@"[Captions] %@ serve helper started (PID %d); loading model once...", engineLabel, task.processIdentifier);
+
+    // Wait for the model to load (first run may download ~1 GB + specialize).
+    long r = dispatch_semaphore_wait(sWhisperServeReadySem,
+                                     dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1800.0 * NSEC_PER_SEC)));
+    if (r != 0 || !sWhisperServeReady || !sWhisperServeTask.isRunning) {
+        NSString *stderrTail = nil;
+        @synchronized (sWhisperServeStderrAccum) {
+            stderrTail = [[NSString alloc] initWithData:sWhisperServeStderrAccum encoding:NSUTF8StringEncoding];
+        }
+        SpliceKit_log(@"[Captions] %@ serve helper did not become ready (timedOut=%@). Helper stderr:\n%@",
+                      engineLabel, (r != 0) ? @"YES" : @"NO",
+                      stderrTail.length ? stderrTail : @"(no stderr — likely an old binary without --serve, or it crashed on launch)");
+        SpliceKitWhisperServe_teardown();
+        return NO;
+    }
+    SpliceKit_log(@"[Captions] %@ serve helper ready (model warm for the session)", engineLabel);
+    return YES;
+}
+
+// Run one request against the warm helper. Returns the stdout JSON line, or nil.
+static NSData *SpliceKitWhisperServe_request(NSString *binaryPath, NSString *modelArg, NSString *engineLabel,
+                                             NSString *manifestPath, void (^progress)(double, NSString *),
+                                             NSString **errorOut) {
+    if (!sWhisperServeLock) sWhisperServeLock = [[NSLock alloc] init];
+    [sWhisperServeLock lock];
+    NSData *result = nil;
+    @try {
+        sWhisperServeProgress = progress;
+        if (!SpliceKitWhisperServe_ensureRunning(binaryPath, modelArg, engineLabel)) {
+            if (errorOut) *errorOut = [NSString stringWithFormat:@"%@ helper failed to start. Check log for details.", engineLabel];
+            return nil;
+        }
+        sWhisperServeResponseLine = nil;
+        @try {
+            [sWhisperServeStdin.fileHandleForWriting writeData:
+                [[manifestPath stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
+        } @catch (NSException *e) {
+            if (errorOut) *errorOut = [NSString stringWithFormat:@"%@ helper write failed: %@", engineLabel, e.reason];
+            SpliceKitWhisperServe_teardown();
+            return nil;
+        }
+        long r = dispatch_semaphore_wait(sWhisperServeResponseSem,
+                                         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1800.0 * NSEC_PER_SEC)));
+        if (r != 0 || sWhisperServeResponseLine == nil || !(sWhisperServeTask && sWhisperServeTask.isRunning)) {
+            if (errorOut) *errorOut = [NSString stringWithFormat:@"%@ transcription did not return (helper died or timed out). Check log for details.", engineLabel];
+            SpliceKitWhisperServe_teardown();
+            return nil;
+        }
+        result = sWhisperServeResponseLine;
+        sWhisperServeResponseLine = nil;
+    } @finally {
+        sWhisperServeProgress = nil;
+        [sWhisperServeLock unlock];
+    }
+    return result;
+}
+
 - (void)performCaptionTranscription {
     NSString *engineID = [self currentEngineID];
 
@@ -2361,9 +2573,16 @@ static void SpliceKit_installDragSpy(void) {
     SpliceKitTranscriptDiag_logClipInfos(clips, engineLabel);
 
     // Filter to clips with media URLs
+    static NSSet<NSString *> *imageExtensions;
+    if (!imageExtensions) {
+        imageExtensions = [NSSet setWithObjects:@"png", @"jpg", @"jpeg", @"heic", @"heif",
+            @"gif", @"tiff", @"tif", @"bmp", @"webp", nil];
+    }
     NSMutableArray *transcribableClips = [NSMutableArray array];
     for (NSDictionary *clipInfo in clips) {
-        if (!clipInfo[@"mediaURL"]) continue;
+        NSURL *mediaURL = clipInfo[@"mediaURL"];
+        if (!mediaURL) continue;
+        if ([imageExtensions containsObject:mediaURL.pathExtension.lowercaseString]) continue;
         double dur = [clipInfo[@"duration"] doubleValue];
         if (dur < 0.5) continue;
         [transcribableClips addObject:clipInfo];
@@ -2384,30 +2603,66 @@ static void SpliceKit_installDragSpy(void) {
         }
     });
 
-    // Build batch manifest — deduplicate source files
+    // Build batch manifest — one entry PER CLIP with its exact source range.
+    // The transcriber decodes only [start, start+duration] and returns word
+    // timestamps relative to the clip start, so we never reassemble by source
+    // timestamp. This avoids dropping words when Whisper's full-file word
+    // timestamps drift across a clip boundary (results[i] maps to clip[i]).
     NSString *manifestPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"splicekit_caption_batch.json"];
-    NSMutableOrderedSet *uniqueFiles = [NSMutableOrderedSet orderedSet];
+    NSMutableArray *manifestEntries = [NSMutableArray arrayWithCapacity:transcribableClips.count];
     for (NSDictionary *clipInfo in transcribableClips) {
         NSURL *mediaURL = clipInfo[@"mediaURL"];
-        [uniqueFiles addObject:mediaURL.path];
-    }
-    NSMutableArray *manifestEntries = [NSMutableArray array];
-    for (NSString *file in uniqueFiles) {
-        [manifestEntries addObject:@{@"file": file}];
+        double trimStart = [clipInfo[@"trimStart"] doubleValue];
+        double mediaOrigin = [clipInfo[@"mediaOrigin"] doubleValue];
+        double clipDuration = [clipInfo[@"duration"] doubleValue];
+        double fileRelativeTrimStart = trimStart - mediaOrigin;
+        if (fileRelativeTrimStart < 0) fileRelativeTrimStart = 0;
+        [manifestEntries addObject:@{
+            @"file": mediaURL.path,
+            @"start": @(fileRelativeTrimStart),
+            @"duration": @(clipDuration),
+        }];
     }
     NSData *manifestData = [NSJSONSerialization dataWithJSONObject:manifestEntries options:0 error:nil];
     [manifestData writeToFile:manifestPath atomically:YES];
     SpliceKitTranscriptDiag_logBatchManifest(manifestEntries);
 
-    SpliceKit_log(@"[Captions] %@ batch: %lu clips, %lu unique source files",
-        engineLabel, (unsigned long)transcribableClips.count, (unsigned long)uniqueFiles.count);
+    NSUInteger uniqueFileCount = [[NSSet setWithArray:[manifestEntries valueForKey:@"file"]] count];
+    SpliceKit_log(@"[Captions] %@ batch: %lu clips (per-clip ranges), %lu unique source files",
+        engineLabel, (unsigned long)transcribableClips.count, (unsigned long)uniqueFileCount);
 
-    // Run transcriber binary
+    // Whisper engines use a persistent warm helper so the CoreML model is
+    // loaded/specialized once per session instead of on every transcription.
+    NSData *stdoutData = nil;
+    if ([engineID hasPrefix:@"whisper"]) {
+        __weak typeof(self) weakSelf = self;
+        NSString *serveErr = nil;
+        stdoutData = SpliceKitWhisperServe_request(binaryPath, modelArg, engineLabel, manifestPath,
+            ^(double frac, NSString *msg) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    __strong typeof(weakSelf) s = weakSelf;
+                    if (!s) return;
+                    if (s.progressBar) {
+                        s.progressBar.indeterminate = NO;
+                        s.progressBar.doubleValue = frac;
+                    }
+                    s.statusLabel.stringValue = [NSString stringWithFormat:@"%@: %@", engineLabel, msg];
+                });
+            }, &serveErr);
+        [[NSFileManager defaultManager] removeItemAtPath:manifestPath error:nil];
+        if (!stdoutData) {
+            [self transcriptionFailedWithError:serveErr ?: [NSString stringWithFormat:@"%@ transcription failed. Check log for details.", engineLabel]];
+            return;
+        }
+        SpliceKitTranscriptDiag_logProcessExit(0, stdoutData, [NSData data], 0);
+    } else {
+    // Run transcriber binary (one-shot subprocess; e.g. Parakeet)
     NSMutableArray *taskArgs = [NSMutableArray arrayWithObjects:@"--batch", manifestPath, @"--progress", @"--model", modelArg, nil];
 
     NSTask *task = [[NSTask alloc] init];
     task.launchPath = binaryPath;
     task.arguments = taskArgs;
+    task.environment = SpliceKitTranscriber_childEnvironment();
 
     NSPipe *stdoutPipe = [NSPipe pipe];
     NSPipe *stderrPipe = [NSPipe pipe];
@@ -2485,7 +2740,6 @@ static void SpliceKit_installDragSpy(void) {
 
     [[NSFileManager defaultManager] removeItemAtPath:manifestPath error:nil];
 
-    NSData *stdoutData;
     NSData *stderrData;
     @synchronized (stdoutAccum) {
         stdoutData = [stdoutAccum copy];
@@ -2514,6 +2768,7 @@ static void SpliceKit_installDragSpy(void) {
         [self transcriptionFailedWithError:[NSString stringWithFormat:@"%@ transcription failed (exit code %d). Check log for details.", engineLabel, exitCode]];
         return;
     }
+    } // end one-shot (non-whisper) branch
 
     // Parse JSON output
     NSData *jsonData = stdoutData;
@@ -2544,59 +2799,84 @@ static void SpliceKit_installDragSpy(void) {
         return;
     }
 
-    // Map results back to clips
+    // Map results back to clips BY INDEX. Each manifest entry was one clip, and
+    // both transcribers emit exactly one result per entry in order, so
+    // batchResults[i] corresponds to transcribableClips[i]. Word timestamps are
+    // already clip-relative (the transcriber decoded only the clip's range), so
+    // mapping is a simple offset by the clip's timeline start — no source-time
+    // window filtering, which is what previously dropped words on timestamp drift.
     SpliceKitTranscriptDiag_logParsedResults(batchResults);
-    NSMutableDictionary *resultsByFile = [NSMutableDictionary dictionary];
+
+    if (batchResults.count != transcribableClips.count) {
+        SpliceKit_log(@"[Captions] WARNING: result count %lu != clip count %lu; "
+            @"falling back to (file,start) matching",
+            (unsigned long)batchResults.count, (unsigned long)transcribableClips.count);
+    }
+
+    // Index results by (file|start) as a fallback for count mismatches.
+    NSMutableDictionary<NSString *, NSArray *> *resultsByKey = [NSMutableDictionary dictionary];
     for (NSDictionary *result in batchResults) {
         NSString *file = result[@"file"];
         NSArray *words = result[@"words"];
         if (file && [words isKindOfClass:[NSArray class]]) {
-            resultsByFile[file] = words;
+            double start = [result[@"start"] doubleValue];
+            resultsByKey[[NSString stringWithFormat:@"%@|%.3f", file, start]] = words;
         }
     }
 
-    // Build words array
     NSMutableArray<SpliceKitTranscriptWord *> *allWords = [NSMutableArray array];
-    for (NSDictionary *clipInfo in transcribableClips) {
+    for (NSUInteger i = 0; i < transcribableClips.count; i++) {
+        NSDictionary *clipInfo = transcribableClips[i];
         NSURL *mediaURL = clipInfo[@"mediaURL"];
         double timelineStart = [clipInfo[@"timelineStart"] doubleValue];
         double trimStart = [clipInfo[@"trimStart"] doubleValue];
         double clipDuration = [clipInfo[@"duration"] doubleValue];
         double mediaOrigin = [clipInfo[@"mediaOrigin"] doubleValue];
         NSString *clipHandle = clipInfo[@"handle"];
+        double fileRelativeTrimStart = trimStart - mediaOrigin;
+        if (fileRelativeTrimStart < 0) fileRelativeTrimStart = 0;
 
-        NSArray *wordDicts = resultsByFile[mediaURL.path];
+        // Prefer positional match (results[i] == clip[i]); fall back to key match.
+        NSArray *wordDicts = nil;
+        if (i < batchResults.count && [batchResults[i][@"words"] isKindOfClass:[NSArray class]]) {
+            wordDicts = batchResults[i][@"words"];
+        } else {
+            wordDicts = resultsByKey[[NSString stringWithFormat:@"%@|%.3f", mediaURL.path, fileRelativeTrimStart]];
+        }
         if (!wordDicts) {
             SpliceKitTranscriptDiag_logWordFiltering(mediaURL.lastPathComponent,
                 @[], trimStart, mediaOrigin, clipDuration, 0);
             continue;
         }
 
-        // Convert trimStart from FCP's timecode coordinate space to file-relative
-        double fileRelativeTrimStart = trimStart - mediaOrigin;
         NSUInteger wordsAddedForClip = 0;
-
         for (NSDictionary *wd in wordDicts) {
             NSString *text = wd[@"word"];
-            double startTime = [wd[@"startTime"] doubleValue];
+            double startTime = [wd[@"startTime"] doubleValue];   // clip-relative
             double endTime = [wd[@"endTime"] doubleValue];
             double confidence = [wd[@"confidence"] doubleValue];
 
-            if (startTime >= fileRelativeTrimStart && startTime < fileRelativeTrimStart + clipDuration) {
-                SpliceKitTranscriptWord *word = [[SpliceKitTranscriptWord alloc] init];
-                word.text = text;
-                word.startTime = timelineStart + (startTime - fileRelativeTrimStart);
-                word.duration = MIN(endTime - startTime, (fileRelativeTrimStart + clipDuration) - startTime);
-                word.endTime = word.startTime + word.duration;
-                word.confidence = confidence;
-                word.clipHandle = clipHandle;
-                word.clipTimelineStart = timelineStart;
-                word.sourceMediaOffset = trimStart;
-                word.sourceMediaTime = startTime + mediaOrigin;
-                word.sourceMediaPath = mediaURL.path;
-                [allWords addObject:word];
-                wordsAddedForClip++;
-            }
+            // Clamp to the clip so a word that slightly overruns the range edge
+            // (Whisper can append trailing punctuation past the cut) stays inside.
+            if (startTime < 0) startTime = 0;
+            if (startTime >= clipDuration) continue;
+            double dur = endTime - startTime;
+            if (dur <= 0) dur = 1.0 / 30.0;
+            dur = MIN(dur, clipDuration - startTime);
+
+            SpliceKitTranscriptWord *word = [[SpliceKitTranscriptWord alloc] init];
+            word.text = text;
+            word.startTime = timelineStart + startTime;
+            word.duration = dur;
+            word.endTime = word.startTime + word.duration;
+            word.confidence = confidence;
+            word.clipHandle = clipHandle;
+            word.clipTimelineStart = timelineStart;
+            word.sourceMediaOffset = trimStart;
+            word.sourceMediaTime = fileRelativeTrimStart + startTime + mediaOrigin;
+            word.sourceMediaPath = mediaURL.path;
+            [allWords addObject:word];
+            wordsAddedForClip++;
         }
         SpliceKitTranscriptDiag_logWordFiltering(mediaURL.lastPathComponent,
             wordDicts, trimStart, mediaOrigin, clipDuration, wordsAddedForClip);

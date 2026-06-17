@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import WhisperKit
 
@@ -29,7 +30,23 @@ func printError(_ message: String) {
     progressLock.unlock()
 }
 
-struct BatchEntry { let file: String }
+// A transcription request. When `start`/`duration` are set (per-clip captioning),
+// only that source range is decoded and word timestamps are relative to `start`
+// (i.e. 0-based within the clip). When nil, the whole file is transcribed
+// (transcript-panel / whole-file behavior).
+struct BatchEntry {
+    let file: String
+    let start: Double?
+    let duration: Double?
+}
+
+// Parse one manifest entry into a BatchEntry, reading optional start/duration.
+func parseBatchEntry(_ entry: [String: Any]) -> BatchEntry? {
+    guard let file = entry["file"] as? String else { return nil }
+    let start = (entry["start"] as? NSNumber)?.doubleValue
+    let duration = (entry["duration"] as? NSNumber)?.doubleValue
+    return BatchEntry(file: file, start: start, duration: duration)
+}
 
 let args = CommandLine.arguments
 guard args.count >= 2 else {
@@ -40,6 +57,10 @@ guard args.count >= 2 else {
 
 let showProgress = args.contains("--progress")
 let batchMode = args.contains("--batch")
+// Persistent server mode: load the model once, then service transcription
+// requests (manifest paths, one per line) from stdin. This avoids the cold-start
+// CoreML/ANE specialization that otherwise happens on every subprocess launch.
+let serveMode = args.contains("--serve")
 
 // Default to large-v3-turbo (much faster, nearly identical quality for captions).
 // WhisperKit variant names match HuggingFace repo subdirs under argmaxinc/whisperkit-coreml.
@@ -72,17 +93,19 @@ if batchMode {
         exit(1)
     }
     for entry in arr {
-        if let file = entry["file"] as? String { batchEntries.append(BatchEntry(file: file)) }
+        if let be = parseBatchEntry(entry) { batchEntries.append(be) }
     }
     if batchEntries.isEmpty {
         printError("No files in batch manifest"); exit(1)
     }
+} else if serveMode {
+    // No audio path on the command line; requests arrive on stdin after load.
 } else {
     let audioPath = args[1]
     guard FileManager.default.fileExists(atPath: audioPath) else {
         printError("File not found: \(audioPath)"); exit(1)
     }
-    batchEntries.append(BatchEntry(file: audioPath))
+    batchEntries.append(BatchEntry(file: audioPath, start: nil, duration: nil))
 }
 
 // Models live under ~/Library/Application Support/SpliceKit/Models/whisper/
@@ -139,6 +162,95 @@ func normalizedWordTimings(_ words: [[String: Any]], minimumDuration: Float = 1.
     return normalized
 }
 
+enum AudioDecodeError: Error, LocalizedError {
+    case noAudioTrack
+    case readerSetupFailed(String)
+    case readFailed(String)
+    var errorDescription: String? {
+        switch self {
+        case .noAudioTrack: return "No audio track found in file"
+        case .readerSetupFailed(let m): return "Audio reader setup failed: \(m)"
+        case .readFailed(let m): return "Audio decode failed: \(m)"
+        }
+    }
+}
+
+// Decode any AVFoundation-readable container (including video files like .mov/.mp4)
+// to 16 kHz mono Float PCM. WhisperKit's built-in loader uses AVAudioFile(forReading:),
+// which rejects video containers with kAudioFileUnsupportedFileTypeError ('typ?',
+// 1954115647). AVAssetReader decodes them the same way Parakeet/FluidAudio does, so
+// any clip that transcribes under Parakeet also works here.
+func decodeAudioTo16kMono(path: String, start: Double? = nil, duration: Double? = nil) async throws -> [Float] {
+    let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+
+    let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+    guard !audioTracks.isEmpty else { throw AudioDecodeError.noAudioTrack }
+
+    let reader: AVAssetReader
+    do {
+        reader = try AVAssetReader(asset: asset)
+    } catch {
+        throw AudioDecodeError.readerSetupFailed(error.localizedDescription)
+    }
+
+    // Restrict decoding to [start, start+duration] for per-clip transcription.
+    // The collected samples become a 0-based [Float] window, so model word
+    // timestamps come out relative to the clip start.
+    if let start = start, start >= 0, let duration = duration, duration > 0 {
+        let t0 = CMTimeMakeWithSeconds(start, preferredTimescale: 600)
+        let dur = CMTimeMakeWithSeconds(duration, preferredTimescale: 600)
+        reader.timeRange = CMTimeRange(start: t0, duration: dur)
+    }
+
+    // Ask AVFoundation to resample/downmix to WhisperKit's required 16 kHz mono Float32.
+    let outputSettings: [String: Any] = [
+        AVFormatIDKey: kAudioFormatLinearPCM,
+        AVLinearPCMBitDepthKey: 32,
+        AVLinearPCMIsFloatKey: true,
+        AVLinearPCMIsBigEndianKey: false,
+        AVLinearPCMIsNonInterleaved: false,
+        AVSampleRateKey: 16000,
+        AVNumberOfChannelsKey: 1,
+    ]
+    let output = AVAssetReaderAudioMixOutput(audioTracks: audioTracks, audioSettings: outputSettings)
+    output.alwaysCopiesSampleData = false
+    guard reader.canAdd(output) else {
+        throw AudioDecodeError.readerSetupFailed("cannot add audio mix output")
+    }
+    reader.add(output)
+
+    guard reader.startReading() else {
+        throw AudioDecodeError.readFailed(reader.error?.localizedDescription ?? "startReading returned false")
+    }
+
+    var samples: [Float] = []
+    while let sampleBuffer = output.copyNextSampleBuffer() {
+        defer { CMSampleBufferInvalidate(sampleBuffer) }
+        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
+        let length = CMBlockBufferGetDataLength(blockBuffer)
+        if length == 0 { continue }
+        var dataPointer: UnsafeMutablePointer<Int8>? = nil
+        var lengthAtOffset = 0
+        var totalLength = 0
+        let status = CMBlockBufferGetDataPointer(
+            blockBuffer, atOffset: 0,
+            lengthAtOffsetOut: &lengthAtOffset,
+            totalLengthOut: &totalLength,
+            dataPointerOut: &dataPointer)
+        guard status == kCMBlockBufferNoErr, let dataPointer = dataPointer else { continue }
+        let floatCount = length / MemoryLayout<Float>.size
+        dataPointer.withMemoryRebound(to: Float.self, capacity: floatCount) { floatPtr in
+            samples.append(contentsOf: UnsafeBufferPointer(start: floatPtr, count: floatCount))
+        }
+    }
+
+    if reader.status == .failed {
+        throw AudioDecodeError.readFailed(reader.error?.localizedDescription ?? "unknown reader failure")
+    }
+
+    return samples
+}
+
 func extractWords(from transcription: [TranscriptionResult]) -> [[String: Any]] {
     var words: [[String: Any]] = []
     for result in transcription {
@@ -169,6 +281,51 @@ func extractWords(from transcription: [TranscriptionResult]) -> [[String: Any]] 
         }
     }
     return normalizedWordTimings(words)
+}
+
+// Shared decode options for every transcription path (serve, batch, single).
+//
+// chunkingStrategy: .none — Use .none rather than .vad: VAD was dropping long
+// stretches of the source (e.g. first 83s of a 4-min Tim Keller meditation,
+// ~70% fewer words than Parakeet). .none slides a 30s window across the whole
+// file so nothing is skipped. For a 4-min file this costs seconds of extra
+// inference.
+//
+// Whisper produced large gaps where audio wasn't captioned on real footage. Two
+// independent WhisperKit mechanisms cause this; both are disabled here.
+//
+// 1) chunkingStrategy: .vad — With .none, WhisperKit runs one long-form seek loop
+//    across the whole file. The decoder can emit a far-ahead end-timestamp and
+//    `seek` jumps past audio, silently dropping it. Verified on this repo's
+//    footage: a ~10s stretch of clear voiceover ("Everyone knows NVIDIA TSMC and
+//    ASML, who makes the machines that make the chips") was emitted nothing in
+//    the full-file run but transcribed fine when that region was clipped out and
+//    fed standalone. .vad splits the audio into CONTIGUOUS chunks at silence
+//    midpoints (AudioChunker.chunkAll drops no audio) and resets seek per chunk,
+//    so the seek-skip can't accumulate. This lifted the file from 301 -> 430
+//    words and filled the dropped voiceover.
+//
+// 2) noSpeechThreshold: nil — WhisperKit discards an entire window
+//    (SegmentSeeker.findSeekPointAndSegments) when noSpeechProb > noSpeechThreshold
+//    AND avgLogProb <= logProbThreshold. A music bed inflates noSpeechProb, so
+//    real speech under music gets gated out. This was also the likely cause of an
+//    earlier regression where VAD "dropped" 83s of a quiet meditation — quiet
+//    chunks were gated, not lost by chunking. Setting it to nil keeps whatever the
+//    decoder produced for every chunk. compressionRatioThreshold (default 2.4) +
+//    temperature fallback still guard against runaway repetition/hallucination on
+//    genuinely silent stretches; logProbThreshold (slightly loosened) is retained
+//    for the temperature-fallback quality check only.
+func makeDecodeOptions() -> DecodingOptions {
+    DecodingOptions(
+        verbose: false,
+        task: .transcribe,
+        language: nil,
+        temperature: 0.0,
+        wordTimestamps: true,
+        logProbThreshold: -1.5,
+        noSpeechThreshold: nil,
+        chunkingStrategy: ChunkingStrategy.vad
+    )
 }
 
 let semaphore = DispatchSemaphore(value: 0)
@@ -252,14 +409,90 @@ Task {
 
         if showProgress { reportProgress(0.68, "\(prettyName) ready") }
 
+        // Shared decode options (see note below on chunkingStrategy: .none and
+        // the loosened no-speech/logprob thresholds).
+        let sharedOptions = makeDecodeOptions()
+
+        // ── Persistent server mode ──────────────────────────────────────────
+        // Model is now loaded/specialized once. Loop over stdin requests, keeping
+        // the model warm so no further CoreML compilation happens per transcription.
+        if serveMode {
+            // Tell the host the model is loaded and we're ready for requests.
+            FileHandle.standardError.write("READY\n".data(using: .utf8)!)
+            if showProgress { reportProgress(0.7, "\(prettyName) ready — awaiting requests") }
+
+            while let raw = readLine(strippingNewline: true) {
+                let manifestPath = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                if manifestPath.isEmpty { continue }
+                if manifestPath == "__QUIT__" { break }
+
+                var entries: [BatchEntry] = []
+                if let data = FileManager.default.contents(atPath: manifestPath),
+                   let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                    for e in arr { if let be = parseBatchEntry(e) { entries.append(be) } }
+                } else {
+                    printError("Failed to read request manifest: \(manifestPath)")
+                }
+
+                var results: [[String: Any]] = []
+                let total = Double(max(entries.count, 1))
+                for (idx, entry) in entries.enumerated() {
+                    if showProgress {
+                        let pct = 0.05 + 0.9 * Double(idx) / total
+                        reportProgress(pct, "Transcribing \(idx + 1)/\(entries.count): \((entry.file as NSString).lastPathComponent)...")
+                    }
+                    let startEcho = entry.start ?? -1
+                    guard FileManager.default.fileExists(atPath: entry.file) else {
+                        results.append(["file": entry.file, "start": startEcho, "words": [] as [Any], "error": "File not found"])
+                        continue
+                    }
+                    do {
+                        let samples = try await decodeAudioTo16kMono(path: entry.file, start: entry.start, duration: entry.duration)
+                        if samples.isEmpty {
+                            results.append(["file": entry.file, "start": startEcho, "words": [] as [Any], "error": "No audio samples"])
+                            continue
+                        }
+                        let r: [TranscriptionResult] = try await whisper.transcribe(audioArray: samples, decodeOptions: sharedOptions)
+                        results.append(["file": entry.file, "start": startEcho, "words": extractWords(from: r)])
+                    } catch {
+                        results.append(["file": entry.file, "start": startEcho, "words": [] as [Any], "error": error.localizedDescription])
+                    }
+                }
+
+                if showProgress {
+                    let totalWords = results.reduce(0) { $0 + (($1["words"] as? [[String: Any]])?.count ?? 0) }
+                    reportProgress(1.0, "Done — \(totalWords) words")
+                }
+
+                // Emit the result framed by a unique token so any CoreML/E5RT noise
+                // printed to stdout can't be mistaken for a response. Written via the
+                // raw fd because stdout is fully buffered when it's a pipe.
+                let payload: Data
+                if let jsonData = try? JSONSerialization.data(withJSONObject: results, options: [.sortedKeys]) {
+                    payload = jsonData
+                } else {
+                    payload = "[]".data(using: .utf8)!
+                }
+                var line = "__SK_JSON__".data(using: .utf8)!
+                line.append(payload)
+                line.append("\n".data(using: .utf8)!)
+                FileHandle.standardOutput.write(line)
+            }
+
+            exitCode = 0
+            semaphore.signal()
+            return
+        }
+
         let totalFiles = Double(batchEntries.count)
         var allResults: [[String: Any]] = []
 
         for (index, entry) in batchEntries.enumerated() {
+            let startEcho = entry.start ?? -1
             guard FileManager.default.fileExists(atPath: entry.file) else {
                 printError("File not found: \(entry.file)")
                 if batchMode {
-                    allResults.append(["file": entry.file, "words": [] as [Any], "error": "File not found"])
+                    allResults.append(["file": entry.file, "start": startEcho, "words": [] as [Any], "error": "File not found"])
                 }
                 continue
             }
@@ -269,31 +502,31 @@ Task {
                 reportProgress(pct, "Transcribing \(index + 1)/\(Int(totalFiles)): \(name)...")
             }
 
-            // Use .none rather than .vad: VAD was dropping long stretches of the source
-            // (e.g. first 83s of a 4-min Tim Keller meditation, ~70% fewer words than
-            // Parakeet). .none slides a 30s window across the whole file so nothing is
-            // skipped. For a 4-min file this costs seconds of extra inference.
-            let options = DecodingOptions(
-                verbose: false,
-                task: .transcribe,
-                language: nil,
-                temperature: 0.0,
-                wordTimestamps: true,
-                chunkingStrategy: .none
-            )
+            let options = makeDecodeOptions()
 
             do {
-                let results = try await whisper.transcribe(audioPath: entry.file, decodeOptions: options)
+                // Decode through AVAssetReader instead of letting WhisperKit open the
+                // file with AVAudioFile — the latter fails on video containers with
+                // 'typ?' (kAudioFileUnsupportedFileTypeError). Hand it raw 16 kHz samples.
+                let samples = try await decodeAudioTo16kMono(path: entry.file, start: entry.start, duration: entry.duration)
+                if samples.isEmpty {
+                    printError("No audio samples decoded from \(entry.file) (silent or no audio track)")
+                    if batchMode {
+                        allResults.append(["file": entry.file, "start": startEcho, "words": [] as [Any], "error": "No audio samples"])
+                    }
+                    continue
+                }
+                let results: [TranscriptionResult] = try await whisper.transcribe(audioArray: samples, decodeOptions: options)
                 let words = extractWords(from: results)
                 if batchMode {
-                    allResults.append(["file": entry.file, "words": words])
+                    allResults.append(["file": entry.file, "start": startEcho, "words": words])
                 } else {
                     allResults = words
                 }
             } catch {
                 printError("Transcription failed for \(entry.file): \(error.localizedDescription)")
                 if batchMode {
-                    allResults.append(["file": entry.file, "words": [] as [Any], "error": error.localizedDescription])
+                    allResults.append(["file": entry.file, "start": startEcho, "words": [] as [Any], "error": error.localizedDescription])
                 } else {
                     throw error
                 }

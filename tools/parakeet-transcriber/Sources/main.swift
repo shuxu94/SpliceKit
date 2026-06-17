@@ -17,7 +17,96 @@ import FluidAudio
 // Speaker diarization via FluidAudio OfflineDiarizerManager (pyannote-based)
 
 import os.log
+import AVFoundation
 let progressLock = NSLock()
+
+enum AudioDecodeError: Error, LocalizedError {
+    case noAudioTrack
+    case readerSetupFailed(String)
+    case readFailed(String)
+    var errorDescription: String? {
+        switch self {
+        case .noAudioTrack: return "No audio track found in file"
+        case .readerSetupFailed(let m): return "Audio reader setup failed: \(m)"
+        case .readFailed(let m): return "Audio decode failed: \(m)"
+        }
+    }
+}
+
+// Decode any AVFoundation-readable container (including video files like .mov/.mp4)
+// to 16 kHz mono Float PCM. FluidAudio's URL-based transcribe uses
+// AVAudioFile(forReading:), which rejects video containers with
+// kAudioFileUnsupportedFileTypeError ('typ?', 1954115647). AVAssetReader decodes
+// them, and the [Float] transcribe overload takes the samples directly.
+func decodeAudioTo16kMono(path: String, start: Double? = nil, duration: Double? = nil) async throws -> [Float] {
+    let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+
+    let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+    guard !audioTracks.isEmpty else { throw AudioDecodeError.noAudioTrack }
+
+    let reader: AVAssetReader
+    do {
+        reader = try AVAssetReader(asset: asset)
+    } catch {
+        throw AudioDecodeError.readerSetupFailed(error.localizedDescription)
+    }
+
+    // Restrict decoding to [start, start+duration] for per-clip transcription, so
+    // the collected samples form a 0-based window and word timestamps come out
+    // relative to the clip start.
+    if let start = start, start >= 0, let duration = duration, duration > 0 {
+        let t0 = CMTimeMakeWithSeconds(start, preferredTimescale: 600)
+        let dur = CMTimeMakeWithSeconds(duration, preferredTimescale: 600)
+        reader.timeRange = CMTimeRange(start: t0, duration: dur)
+    }
+
+    let outputSettings: [String: Any] = [
+        AVFormatIDKey: kAudioFormatLinearPCM,
+        AVLinearPCMBitDepthKey: 32,
+        AVLinearPCMIsFloatKey: true,
+        AVLinearPCMIsBigEndianKey: false,
+        AVLinearPCMIsNonInterleaved: false,
+        AVSampleRateKey: 16000,
+        AVNumberOfChannelsKey: 1,
+    ]
+    let output = AVAssetReaderAudioMixOutput(audioTracks: audioTracks, audioSettings: outputSettings)
+    output.alwaysCopiesSampleData = false
+    guard reader.canAdd(output) else {
+        throw AudioDecodeError.readerSetupFailed("cannot add audio mix output")
+    }
+    reader.add(output)
+
+    guard reader.startReading() else {
+        throw AudioDecodeError.readFailed(reader.error?.localizedDescription ?? "startReading returned false")
+    }
+
+    var samples: [Float] = []
+    while let sampleBuffer = output.copyNextSampleBuffer() {
+        defer { CMSampleBufferInvalidate(sampleBuffer) }
+        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
+        let length = CMBlockBufferGetDataLength(blockBuffer)
+        if length == 0 { continue }
+        var dataPointer: UnsafeMutablePointer<Int8>? = nil
+        var lengthAtOffset = 0
+        var totalLength = 0
+        let status = CMBlockBufferGetDataPointer(
+            blockBuffer, atOffset: 0,
+            lengthAtOffsetOut: &lengthAtOffset,
+            totalLengthOut: &totalLength,
+            dataPointerOut: &dataPointer)
+        guard status == kCMBlockBufferNoErr, let dataPointer = dataPointer else { continue }
+        let floatCount = length / MemoryLayout<Float>.size
+        dataPointer.withMemoryRebound(to: Float.self, capacity: floatCount) { floatPtr in
+            samples.append(contentsOf: UnsafeBufferPointer(start: floatPtr, count: floatCount))
+        }
+    }
+
+    if reader.status == .failed {
+        throw AudioDecodeError.readFailed(reader.error?.localizedDescription ?? "unknown reader failure")
+    }
+
+    return samples
+}
 
 func reportProgress(_ fraction: Double, _ message: String) {
     progressLock.lock()
@@ -166,8 +255,20 @@ if let modelIdx = args.firstIndex(of: "--model"), modelIdx + 1 < args.count {
 }
 
 // Determine input files
+// When `start`/`duration` are set (per-clip captioning), only that source range
+// is decoded and word timestamps are relative to `start` (0-based within the
+// clip). When nil, the whole file is transcribed (transcript-panel behavior).
 struct BatchEntry {
     let file: String
+    let start: Double?
+    let duration: Double?
+}
+
+func parseBatchEntry(_ entry: [String: Any]) -> BatchEntry? {
+    guard let file = entry["file"] as? String else { return nil }
+    let start = (entry["start"] as? NSNumber)?.doubleValue
+    let duration = (entry["duration"] as? NSNumber)?.doubleValue
+    return BatchEntry(file: file, start: start, duration: duration)
 }
 
 var batchEntries: [BatchEntry] = []
@@ -184,8 +285,8 @@ if batchMode {
         exit(1)
     }
     for entry in arr {
-        if let file = entry["file"] as? String {
-            batchEntries.append(BatchEntry(file: file))
+        if let be = parseBatchEntry(entry) {
+            batchEntries.append(be)
         }
     }
     if batchEntries.isEmpty {
@@ -198,7 +299,7 @@ if batchMode {
         printError("File not found: \(audioPath)")
         exit(1)
     }
-    batchEntries.append(BatchEntry(file: audioPath))
+    batchEntries.append(BatchEntry(file: audioPath, start: nil, duration: nil))
 }
 
 let semaphore = DispatchSemaphore(value: 0)
@@ -287,8 +388,11 @@ Task {
 
         let totalFiles = Double(batchEntries.count)
 
-        // Phase 1: Transcribe all files (ASR actor serializes these, runs on ANE)
-        var asrResults: [(index: Int, file: String, result: ASRResult)] = []
+        // Phase 1: Transcribe all entries (ASR actor serializes these, runs on ANE).
+        // Results are stored by manifest index so the output preserves entry order
+        // even when the same file appears multiple times (per-clip captioning) or
+        // some entries fail.
+        var resultByIndex: [Int: ASRResult] = [:]
         for (index, entry) in batchEntries.enumerated() {
             let fileURL = URL(fileURLWithPath: entry.file)
             guard FileManager.default.fileExists(atPath: entry.file) else {
@@ -299,19 +403,38 @@ Task {
                 let pct = 0.20 + (0.50 * Double(index) / totalFiles)
                 reportProgress(pct, "Transcribing \(index+1)/\(Int(totalFiles)): \(fileURL.lastPathComponent)...")
             }
-            let result = try await manager.transcribe(fileURL, source: .system)
-            asrResults.append((index: index, file: entry.file, result: result))
+            // Decode via AVAssetReader (handles video containers that AVAudioFile
+            // rejects with 'typ?') and feed raw 16 kHz mono samples to FluidAudio.
+            // A fresh decoder state per entry avoids cross-entry context bleed.
+            // Per-entry errors (unreadable file, no audio track, etc.) are skipped
+            // rather than aborting the whole batch.
+            do {
+                let samples = try await decodeAudioTo16kMono(path: entry.file, start: entry.start, duration: entry.duration)
+                if samples.isEmpty {
+                    printError("No audio samples decoded from \(entry.file) (silent or no audio track)")
+                    continue
+                }
+                var decoderState = try TdtDecoderState()
+                let result = try await manager.transcribe(samples, decoderState: &decoderState)
+                resultByIndex[index] = result
+            } catch {
+                printError("Skipping \(entry.file): \(error.localizedDescription)")
+                continue
+            }
         }
 
-        if showProgress { reportProgress(0.70, "Transcription complete — \(asrResults.count) file(s)") }
+        if showProgress { reportProgress(0.70, "Transcription complete — \(resultByIndex.count) entries") }
 
-        // Phase 2: Diarize all files concurrently (CPU-bound, not actor-isolated)
+        // Phase 2: Diarize concurrently (CPU-bound, not actor-isolated). Keyed by
+        // file path. Note: diarization is whole-file and only used by the
+        // transcript panel (whole-file entries); the caption per-clip path runs
+        // without --speakers, so clip ranges don't interact with diarization here.
         var diarizationMap: [String: [TimedSpeakerSegment]] = [:]
         if let diarizer = sharedDiarizer {
-            if showProgress { reportProgress(0.72, "Detecting speakers across \(asrResults.count) file(s)...") }
+            let filesToDiarize = Set(resultByIndex.keys.map { batchEntries[$0].file })
+            if showProgress { reportProgress(0.72, "Detecting speakers across \(filesToDiarize.count) file(s)...") }
             await withTaskGroup(of: (String, [TimedSpeakerSegment]).self) { group in
-                for entry in asrResults {
-                    let filePath = entry.file
+                for filePath in filesToDiarize {
                     group.addTask {
                         let fileURL = URL(fileURLWithPath: filePath)
                         do {
@@ -331,28 +454,23 @@ Task {
             if showProgress { reportProgress(0.90, "Found \(totalSpeakers) speaker(s) across all files") }
         }
 
-        // Phase 3: Build results
+        // Phase 3: Build results in manifest order, one entry per request.
         if showProgress { reportProgress(0.92, "Building word lists...") }
 
         var allResults: [[String: Any]] = []
-        // Track missing files for batch mode
-        let processedFiles = Set(asrResults.map { $0.file })
-        for entry in batchEntries {
-            if !processedFiles.contains(entry.file) {
+        for (index, entry) in batchEntries.enumerated() {
+            let startEcho = entry.start ?? -1
+            if let result = resultByIndex[index] {
+                let speakerSegments = diarizationMap[entry.file] ?? []
+                let words = extractWords(from: result, speakerSegments: speakerSegments)
                 if batchMode {
-                    allResults.append(["file": entry.file, "words": [] as [Any], "error": "File not found"])
+                    allResults.append(["file": entry.file, "start": startEcho, "words": words])
+                } else {
+                    allResults = words
                 }
-            }
-        }
-
-        for entry in asrResults {
-            let speakerSegments = diarizationMap[entry.file] ?? []
-            let words = extractWords(from: entry.result, speakerSegments: speakerSegments)
-
-            if batchMode {
-                allResults.append(["file": entry.file, "words": words])
-            } else {
-                allResults = words
+            } else if batchMode {
+                allResults.append(["file": entry.file, "start": startEcho, "words": [] as [Any],
+                                   "error": "Transcription failed or file not found"])
             }
         }
 

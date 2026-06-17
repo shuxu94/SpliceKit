@@ -58,6 +58,14 @@ WHISPER_PKG_DIR = patcher/SpliceKitPatcher.app/Contents/Resources/tools/whisper-
 WHISPER_RELEASE_BIN = $(WHISPER_PKG_DIR)/.build/release/whisper-transcriber
 WHISPER_DEBUG_BIN = $(WHISPER_PKG_DIR)/.build/debug/whisper-transcriber
 
+# Git-tracked transcriber sources. `make deploy` builds these and prefers the
+# resulting binaries over the (gitignored) patcher copies above, so a stock
+# checkout rebuilds + redeploys the transcribers without any manual swift build.
+PARAKEET_SRC_DIR = tools/parakeet-transcriber
+PARAKEET_LOCAL_BIN = $(PARAKEET_SRC_DIR)/.build/release/parakeet-transcriber
+WHISPER_SRC_DIR = tools/whisper-transcriber
+WHISPER_LOCAL_BIN = $(WHISPER_SRC_DIR)/.build/release/whisper-transcriber
+
 BRAW_SOURCE_DIR = Plugins/BRAW/Sources
 BRAW_PRIVATE_DIR = $(BRAW_SOURCE_DIR)/Private
 BRAW_BUILD_DIR = $(BUILD_DIR)/braw-prototype
@@ -388,7 +396,34 @@ braw-prototype: $(BRAW_IMPORT_EXEC) $(BRAW_DECODER_EXEC) $(BRAW_CLI_BIN)
 braw-raw-processor: $(BRAW_RAWPROC_EXEC)
 	@echo "Staged: $(BRAW_RAWPROC_BUNDLE)"
 
-deploy: $(OUTPUT) $(SILENCE_DETECTOR) $(STRUCTURE_ANALYZER) $(MIXER_APP) vp9-prototype mkv-prototype
+# Build the transcriber CLIs from their git-tracked sources so `make deploy`
+# always redeploys current binaries. swift build is incremental, so these are
+# cheap no-ops when nothing changed. They fail hard rather than deploy a stale
+# binary (a stale transcriber caused subtle "didn't update" bugs before).
+.PHONY: whisper-transcriber parakeet-transcriber
+whisper-transcriber:
+	@if [ -d "$(WHISPER_SRC_DIR)" ]; then \
+		echo "=== Building whisper-transcriber ($(WHISPER_SRC_DIR)) ==="; \
+		if ( cd "$(WHISPER_SRC_DIR)" && swift build -c release ); then \
+			echo "  Built: $(WHISPER_LOCAL_BIN)"; \
+		else \
+			echo "  ERROR: whisper-transcriber build FAILED — aborting so a stale binary is not deployed."; \
+			exit 1; \
+		fi; \
+	else echo "  Skipped: $(WHISPER_SRC_DIR) not found"; fi
+
+parakeet-transcriber:
+	@if [ -d "$(PARAKEET_SRC_DIR)" ]; then \
+		echo "=== Building parakeet-transcriber ($(PARAKEET_SRC_DIR)) ==="; \
+		if ( cd "$(PARAKEET_SRC_DIR)" && swift build -c release ); then \
+			echo "  Built: $(PARAKEET_LOCAL_BIN)"; \
+		else \
+			echo "  ERROR: parakeet-transcriber build FAILED."; \
+			exit 1; \
+		fi; \
+	else echo "  Skipped: $(PARAKEET_SRC_DIR) not found"; fi
+
+deploy: $(OUTPUT) $(SILENCE_DETECTOR) $(STRUCTURE_ANALYZER) $(MIXER_APP) vp9-prototype mkv-prototype whisper-transcriber parakeet-transcriber
 	@echo "=== Deploying SpliceKit to modded FCP ==="
 		@rm -rf "$(FW_DIR)"
 		@mkdir -p "$(FW_DIR)/Versions/A/Resources"
@@ -421,14 +456,25 @@ deploy: $(OUTPUT) $(SILENCE_DETECTOR) $(STRUCTURE_ANALYZER) $(MIXER_APP) vp9-pro
 	@cp $(SILENCE_DETECTOR) "$(TOOLS_DIR)/silence-detector" 2>/dev/null || true
 	@cp $(STRUCTURE_ANALYZER) "$(TOOLS_DIR)/structure-analyzer" 2>/dev/null || true
 	@cp $(MIXER_APP) "$(TOOLS_DIR)/SpliceKitMixer" 2>/dev/null || true
-	@if [ -f "$(PARAKEET_RELEASE_BIN)" ]; then \
+	@# parakeet: deploy from local build if present, else patcher copies, else
+	@# leave the existing deployed binary in place (it is not force-built here).
+	@if [ -f "$(PARAKEET_LOCAL_BIN)" ]; then \
+		cp "$(PARAKEET_LOCAL_BIN)" "$(TOOLS_DIR)/parakeet-transcriber"; \
+		cp "$(PARAKEET_LOCAL_BIN)" "$(FW_DIR)/Versions/A/Resources/parakeet-transcriber"; \
+		echo "Deployed parakeet-transcriber (local build)"; \
+	elif [ -f "$(PARAKEET_RELEASE_BIN)" ]; then \
 		cp "$(PARAKEET_RELEASE_BIN)" "$(TOOLS_DIR)/parakeet-transcriber"; \
 		cp "$(PARAKEET_RELEASE_BIN)" "$(FW_DIR)/Versions/A/Resources/parakeet-transcriber"; \
 	elif [ -f "$(PARAKEET_DEBUG_BIN)" ]; then \
 		cp "$(PARAKEET_DEBUG_BIN)" "$(TOOLS_DIR)/parakeet-transcriber"; \
 		cp "$(PARAKEET_DEBUG_BIN)" "$(FW_DIR)/Versions/A/Resources/parakeet-transcriber"; \
 	fi
-	@if [ -f "$(WHISPER_RELEASE_BIN)" ]; then \
+	@# whisper: prefer the freshly-built local tools binary; fall back to patcher.
+	@if [ -f "$(WHISPER_LOCAL_BIN)" ]; then \
+		cp "$(WHISPER_LOCAL_BIN)" "$(TOOLS_DIR)/whisper-transcriber"; \
+		cp "$(WHISPER_LOCAL_BIN)" "$(FW_DIR)/Versions/A/Resources/whisper-transcriber"; \
+		echo "Deployed whisper-transcriber (local build)"; \
+	elif [ -f "$(WHISPER_RELEASE_BIN)" ]; then \
 		cp "$(WHISPER_RELEASE_BIN)" "$(TOOLS_DIR)/whisper-transcriber"; \
 		cp "$(WHISPER_RELEASE_BIN)" "$(FW_DIR)/Versions/A/Resources/whisper-transcriber"; \
 	elif [ -f "$(WHISPER_DEBUG_BIN)" ]; then \

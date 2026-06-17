@@ -2708,22 +2708,37 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     SpliceKitTranscriptDiag_logClipInfos(clips, @"Parakeet");
 
     // Filter to clips with media URLs
+    static NSSet<NSString *> *imageExtensions;
+    if (!imageExtensions) {
+        imageExtensions = [NSSet setWithObjects:@"png", @"jpg", @"jpeg", @"heic", @"heif",
+            @"gif", @"tiff", @"tif", @"bmp", @"webp", nil];
+    }
     NSMutableArray *transcribableClips = [NSMutableArray array];
     NSUInteger skippedNoMedia = 0;
     NSUInteger skippedTooShort = 0;
+    NSUInteger skippedImage = 0;
     for (NSDictionary *clipInfo in clips) {
-        if (!clipInfo[@"mediaURL"]) {
+        NSURL *mediaURL = clipInfo[@"mediaURL"];
+        if (!mediaURL) {
             skippedNoMedia++;
+            continue;
+        }
+        if ([imageExtensions containsObject:mediaURL.pathExtension.lowercaseString]) {
+            skippedImage++;
             continue;
         }
         double dur = [clipInfo[@"duration"] doubleValue];
         if (dur < 0.5) {
             skippedTooShort++;
             SpliceKit_log(@"[Transcript] Skipping clip (%.2fs, too short for transcription): %@",
-                dur, [clipInfo[@"mediaURL"] lastPathComponent]);
+                dur, [mediaURL lastPathComponent]);
             continue;
         }
         [transcribableClips addObject:clipInfo];
+    }
+    if (skippedImage > 0) {
+        SpliceKit_log(@"[Transcript] Skipped %lu still-image clips (no audio track)",
+            (unsigned long)skippedImage);
     }
 
     if (skippedNoMedia > 0) {
@@ -2826,6 +2841,15 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     NSTask *task = [[NSTask alloc] init];
     task.launchPath = binaryPath;
     task.arguments = taskArgs;
+    // Don't inject the SpliceKit dylib into the transcriber child: its constructor
+    // (Sentry, CloudContent guard, subscription check) just adds noise/overhead and
+    // can interfere with the child's networking during model download.
+    {
+        NSMutableDictionary *childEnv = [[[NSProcessInfo processInfo] environment] mutableCopy];
+        [childEnv removeObjectForKey:@"DYLD_INSERT_LIBRARIES"];
+        [childEnv removeObjectForKey:@"DYLD_FORCE_FLAT_NAMESPACE"];
+        task.environment = childEnv;
+    }
 
     NSPipe *stdoutPipe = [NSPipe pipe];
     NSPipe *stderrPipe = [NSPipe pipe];
