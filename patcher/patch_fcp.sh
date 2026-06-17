@@ -18,9 +18,12 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Auto-detect FCP edition: prefer standard, fall back to Creator Studio
 CREATOR_STUDIO_APP="/Applications/Final Cut Pro Creator Studio.app"
 STANDARD_APP="/Applications/Final Cut Pro.app"
+TRIAL_APP="/Applications/Final Cut Pro Trial.app"
 if [[ -z "${SOURCE_APP:-}" ]]; then
     if [[ -d "$STANDARD_APP" ]]; then
         SOURCE_APP="$STANDARD_APP"
+    elif [[ -d "$TRIAL_APP" ]]; then
+        SOURCE_APP="$TRIAL_APP"
     elif [[ -d "$CREATOR_STUDIO_APP" ]]; then
         SOURCE_APP="$CREATOR_STUDIO_APP"
     else
@@ -294,42 +297,20 @@ step "Step 2: Building SpliceKit dylib"
 BUILD_DIR="$REPO_DIR/build"
 mkdir -p "$BUILD_DIR"
 
-# Read canonical source list from Sources/SOURCES.txt
-SOURCES=()
-while IFS= read -r line; do
-    [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
-    SOURCES+=("$REPO_DIR/Sources/$line")
-done < "$REPO_DIR/Sources/SOURCES.txt"
-
-# Build Lua 5.4.7 static library if vendored sources exist
-LUA_DIR="$REPO_DIR/vendor/lua-5.4.7/src"
-LUA_LIB="$BUILD_DIR/liblua.a"
-LUA_FLAGS=""
-if [ -d "$LUA_DIR" ]; then
-    info "Building Lua 5.4.7 static library..."
-    mkdir -p "$BUILD_DIR/lua_obj"
-    for src in "$LUA_DIR"/*.c; do
-        base="$(basename "$src" .c)"
-        [ "$base" = "lua" ] && continue
-        [ "$base" = "luac" ] && continue
-        clang -arch arm64 -arch x86_64 -mmacosx-version-min=14.0 \
-            -DLUA_USE_MACOSX -O2 -Wall -c "$src" -o "$BUILD_DIR/lua_obj/$base.o"
-    done
-    libtool -static -o "$LUA_LIB" "$BUILD_DIR"/lua_obj/*.o
-    LUA_FLAGS="-I $LUA_DIR $LUA_LIB"
-    log "Built: $LUA_LIB"
+# Build the dylib via the canonical Makefile rather than an inline clang line.
+# The source tree now includes C++ (.mm) files (BRAW/VP9/immersive) and links
+# Metal/Vision/CoreImage/Sentry, which the old inline build didn't handle and
+# which would fail to compile/link. `make` produces build/SpliceKit with the
+# undefined-symbol safety check.
+info "Building SpliceKit dylib via make..."
+if ! make -C "$REPO_DIR" 2>&1; then
+    err "Dylib build failed (make)"
+    exit 1
 fi
-
-info "Compiling ${#SOURCES[@]} source files..."
-clang -arch arm64 -arch x86_64 \
-    -mmacosx-version-min=14.0 \
-    -framework Foundation -framework AppKit -framework AVFoundation -framework Speech -framework CoreServices \
-    -fobjc-arc -fmodules -Wno-deprecated-declarations \
-    -undefined dynamic_lookup -dynamiclib \
-    -install_name @rpath/SpliceKit.framework/Versions/A/SpliceKit \
-    -I "$REPO_DIR/Sources" \
-    "${SOURCES[@]}" $LUA_FLAGS \
-    -o "$BUILD_DIR/SpliceKit" 2>&1
+if [[ ! -f "$BUILD_DIR/SpliceKit" ]]; then
+    err "Build reported success but $BUILD_DIR/SpliceKit is missing"
+    exit 1
+fi
 
 log "Built: $(file "$BUILD_DIR/SpliceKit" | grep -o 'universal.*')"
 
@@ -374,10 +355,25 @@ log "Framework installed"
 # ============================================================
 step "Step 4: Injecting dylib into FCP binary"
 
-BINARY="$MODDED_APP/Contents/MacOS/Final Cut Pro"
+# Derive the executable name from the bundle rather than hardcoding "Final Cut
+# Pro" — the trial edition ships as "Final Cut Pro Trial" (and Creator Studio
+# differs too), so the MacOS/ binary name varies by edition.
+EXECUTABLE_NAME="$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$MODDED_APP/Contents/Info.plist" 2>/dev/null || true)"
+[[ -z "$EXECUTABLE_NAME" ]] && EXECUTABLE_NAME="Final Cut Pro"
+BINARY="$MODDED_APP/Contents/MacOS/$EXECUTABLE_NAME"
+if [[ ! -f "$BINARY" ]]; then
+    err "Main executable not found at: $BINARY"
+    info "CFBundleExecutable resolved to '$EXECUTABLE_NAME'; check the app bundle."
+    exit 1
+fi
+log "Main executable: $EXECUTABLE_NAME"
 
-# Check if already injected
-if otool -L "$BINARY" 2>/dev/null | grep -q SpliceKit; then
+# Check if already injected. Match the actual load command, not a bare
+# "SpliceKit" — the destination path itself contains "SpliceKit"
+# (~/Applications/SpliceKit/...), so `otool -L | grep SpliceKit` matches the
+# binary's own path line and would always report a false "already injected",
+# silently skipping the real injection.
+if otool -L "$BINARY" 2>/dev/null | grep -q "@rpath/SpliceKit.framework"; then
     log "Already injected (skipping)"
 else
     # Build insert_dylib if needed
@@ -523,7 +519,7 @@ echo -e "
 ${GREEN}${BOLD}SpliceKit has been installed successfully!${NC}
 
 ${BOLD}Launch:${NC}
-  $MODDED_APP/Contents/MacOS/Final\\ Cut\\ Pro
+  open \"$MODDED_APP\"
 
 ${BOLD}Or double-click:${NC}
   $MODDED_APP

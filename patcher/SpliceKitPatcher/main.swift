@@ -48,6 +48,7 @@ class PatcherModel: ObservableObject {
 
     static let standardApp = "/Applications/Final Cut Pro.app"
     static let creatorStudioApp = "/Applications/Final Cut Pro Creator Studio.app"
+    static let trialApp = "/Applications/Final Cut Pro Trial.app"
 
     @Published var sourceApp: String
     let destDir: String
@@ -62,6 +63,9 @@ class PatcherModel: ObservableObject {
         }
         if FileManager.default.fileExists(atPath: Self.creatorStudioApp) {
             editions.append(("Final Cut Pro Creator Studio", Self.creatorStudioApp))
+        }
+        if FileManager.default.fileExists(atPath: Self.trialApp) {
+            editions.append(("Final Cut Pro Trial", Self.trialApp))
         }
         return editions
     }
@@ -96,7 +100,7 @@ class PatcherModel: ObservableObject {
 
     /// Evaluate install state: is SpliceKit injected? Is it the current build? Is FCP up to date?
     func checkStatus() {
-        let binary = moddedApp + "/Contents/MacOS/Final Cut Pro"
+        let binary = moddedApp + "/Contents/MacOS/" + fcpExecutableName(moddedApp)
         let installedDylib = moddedApp + "/Contents/Frameworks/SpliceKit.framework/Versions/A/SpliceKit"
         let installedPlist = moddedApp + "/Contents/Frameworks/SpliceKit.framework/Versions/A/Resources/Info.plist"
 
@@ -185,7 +189,7 @@ class PatcherModel: ObservableObject {
     }
 
     func launch() {
-        let binary = moddedApp + "/Contents/MacOS/Final Cut Pro"
+        let binary = moddedApp + "/Contents/MacOS/" + fcpExecutableName(moddedApp)
         appendLog("Launching modded FCP...")
         Task.detached {
             let p = Process()
@@ -382,8 +386,12 @@ class PatcherModel: ObservableObject {
 
         // Step 5: Patch the Mach-O binary so dyld loads SpliceKit on launch
         await setStepAsync(.injectDylib)
-        let binary = moddedApp + "/Contents/MacOS/Final Cut Pro"
-        let alreadyInjected = shell("otool -L '\(binary)' 2>/dev/null | grep SpliceKit")
+        let binary = moddedApp + "/Contents/MacOS/" + fcpExecutableName(moddedApp)
+        // Match the actual load command, not a bare "SpliceKit": the modded app
+        // path contains "SpliceKit" (~/Applications/SpliceKit/...), so a plain
+        // `grep SpliceKit` matches the binary's own path line and would always
+        // report a false "already injected", silently skipping real injection.
+        let alreadyInjected = shell("otool -L '\(binary)' 2>/dev/null | grep '@rpath/SpliceKit.framework'")
         if alreadyInjected.isEmpty {
             let insertDylib = "/tmp/splicekit_insert_dylib"
             if !FileManager.default.isExecutableFile(atPath: insertDylib) {
@@ -661,6 +669,15 @@ class PatcherModel: ObservableObject {
         let ver = shell("/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' '\(appPath)/Contents/Info.plist' 2>/dev/null")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return (ver.isEmpty || ver.contains("Doesn't Exist")) ? "" : ver
+    }
+
+    /// The MacOS/ executable name varies by edition: "Final Cut Pro" (standard),
+    /// "Final Cut Pro Trial" (trial), "Final Cut Pro Creator Studio", etc.
+    /// Derive it from CFBundleExecutable instead of hardcoding "Final Cut Pro".
+    nonisolated func fcpExecutableName(_ appPath: String) -> String {
+        let name = shell("/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' '\(appPath)/Contents/Info.plist' 2>/dev/null")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (name.isEmpty || name.contains("Doesn't Exist")) ? "Final Cut Pro" : name
     }
 
     /// Run a shell command synchronously; nonisolated for use in background tasks.
