@@ -374,13 +374,21 @@ $(BRAW_CLI_BIN): $(BRAW_CLI_SRC) | $(BUILD_DIR)
 ENABLE_BRAW_PROTOTYPE ?= 1
 ENABLE_BRAW_RAW_PROCESSOR ?= 0
 
+# The BRAW prototype (format reader + decoder) requires the Blackmagic RAW SDK
+# headers. Auto-disable it when the SDK isn't installed so a stock checkout still
+# builds and deploys. Force it back on with ENABLE_BRAW_PROTOTYPE=1 on the
+# command line if you have the SDK in a non-standard location.
+ifeq ("$(wildcard /Applications/Blackmagic RAW/Blackmagic RAW SDK/Mac/Include/BlackmagicRawAPI.h)","")
+ENABLE_BRAW_PROTOTYPE := 0
+endif
+
 braw-prototype: $(BRAW_IMPORT_EXEC) $(BRAW_DECODER_EXEC) $(BRAW_CLI_BIN)
 	@echo "Staged: $(BRAW_BUILD_DIR)"
 
 braw-raw-processor: $(BRAW_RAWPROC_EXEC)
 	@echo "Staged: $(BRAW_RAWPROC_BUNDLE)"
 
-deploy: $(OUTPUT) $(SILENCE_DETECTOR) $(STRUCTURE_ANALYZER) $(MIXER_APP) braw-prototype vp9-prototype mkv-prototype
+deploy: $(OUTPUT) $(SILENCE_DETECTOR) $(STRUCTURE_ANALYZER) $(MIXER_APP) vp9-prototype mkv-prototype
 	@echo "=== Deploying SpliceKit to modded FCP ==="
 		@rm -rf "$(FW_DIR)"
 		@mkdir -p "$(FW_DIR)/Versions/A/Resources"

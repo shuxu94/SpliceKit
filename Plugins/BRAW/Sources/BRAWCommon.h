@@ -14,6 +14,14 @@
 #define SPLICEKIT_BRAW_SDK_AVAILABLE 0
 #endif
 
+#if !SPLICEKIT_BRAW_SDK_AVAILABLE
+// HRESULT is normally provided by the Blackmagic RAW SDK headers (it mirrors the
+// COM type, defined as int32_t on macOS). When the SDK isn't installed we still
+// need the type so DescribeHRESULT and SDK-facing signatures compile in the
+// stub build. Matches Blackmagic's macOS typedef.
+typedef int32_t HRESULT;
+#endif
+
 namespace SpliceKitBRAW {
 
 constexpr OSType kCodecType = 'braw';

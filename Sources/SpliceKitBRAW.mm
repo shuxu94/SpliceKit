@@ -5756,4 +5756,30 @@ SPLICEKIT_BRAW_EXTERN_C BOOL SpliceKitBRAW_ReadAudioSamples(
     return NO;
 }
 
+SPLICEKIT_BRAW_EXTERN_C NSString *SpliceKitBRAWLookupPathForFormatDescription(CMFormatDescriptionRef fd) {
+    (void)fd;
+    return nil;
+}
+
+SPLICEKIT_BRAW_EXTERN_C BOOL SpliceKitBRAW_GetScaledDimensions(CFStringRef pathRef,
+                                                               uint32_t scaleHint,
+                                                               uint32_t *outWidth,
+                                                               uint32_t *outHeight) {
+    (void)pathRef; (void)scaleHint;
+    if (outWidth) *outWidth = 0;
+    if (outHeight) *outHeight = 0;
+    return NO;
+}
+
+SPLICEKIT_BRAW_EXTERN_C void SpliceKit_bootstrapBRAWAtLaunchPhase(NSString *phase) {
+    (void)phase;
+}
+
+SPLICEKIT_BRAW_EXTERN_C NSDictionary *SpliceKit_handleBRAWAVProbe(NSDictionary *params) {
+    (void)params;
+    return @{
+        @"error": @"Blackmagic RAW SDK headers are not available at /Applications/Blackmagic RAW/Blackmagic RAW SDK/Mac/Include/BlackmagicRawAPI.h",
+    };
+}
+
 #endif
