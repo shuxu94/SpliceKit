@@ -32,10 +32,15 @@ LUA_SRCS = $(filter-out $(LUA_DIR)/lua.c $(LUA_DIR)/luac.c, $(wildcard $(LUA_DIR
 LUA_OBJS = $(patsubst $(LUA_DIR)/%.c, $(BUILD_DIR)/lua/%.o, $(LUA_SRCS))
 LUA_LIB = $(BUILD_DIR)/liblua.a
 
-# Modded app paths — auto-detect standard or Creator Studio edition
+# Modded app paths — one per FCP edition. `make deploy` patches the dylib into
+# every edition found under ~/Applications/SpliceKit; targets that act on a
+# single app (launch, codesign-one) use MODDED_APP = the first edition found.
 MODDED_APP_STANDARD = $(HOME)/Applications/SpliceKit/Final Cut Pro.app
 MODDED_APP_CREATOR = $(HOME)/Applications/SpliceKit/Final Cut Pro Creator Studio.app
-MODDED_APP = $(shell if [ -d "$(MODDED_APP_STANDARD)" ]; then echo "$(MODDED_APP_STANDARD)"; elif [ -d "$(MODDED_APP_CREATOR)" ]; then echo "$(MODDED_APP_CREATOR)"; else echo "$(MODDED_APP_STANDARD)"; fi)
+MODDED_APP_TRIAL = $(HOME)/Applications/SpliceKit/Final Cut Pro Trial.app
+# All candidate editions, in precedence order. The deploy loop iterates these.
+MODDED_APP_CANDIDATES = "$(MODDED_APP_STANDARD)" "$(MODDED_APP_CREATOR)" "$(MODDED_APP_TRIAL)"
+MODDED_APP = $(shell for a in $(MODDED_APP_CANDIDATES); do if [ -d "$$a" ]; then echo "$$a"; exit 0; fi; done; echo "$(MODDED_APP_STANDARD)")
 FW_DIR = $(MODDED_APP)/Contents/Frameworks/SpliceKit.framework
 ENTITLEMENTS = entitlements.plist
 REGISTER_PRO_EXTENSION_APP = $(MODDED_APP)/Contents/Helpers/RegisterProExtension.app
@@ -127,7 +132,7 @@ MKV_FRAMEWORKS = -framework Foundation -framework CoreFoundation -framework Core
 MKV_CFLAGS = $(ARCHS) $(MIN_VERSION) -fno-objc-arc -fmodules -fmodules-cache-path=$(abspath $(MODULE_CACHE_DIR)) -std=c++17 $(DEBUG_FLAGS) -fvisibility=hidden -Wno-deprecated-declarations -I $(MKV_SOURCE_DIR) -I $(MKV_PRIVATE_DIR) -I $(MKV_LIBWEBM_DIR)
 MKV_LDFLAGS = -bundle $(CPP_LIBS)
 
-.PHONY: all clean deploy launch tools url-import-tools audio-bus-probe install-audio-bus-probe uninstall-audio-bus-probe symbols braw-prototype braw-raw-processor vp9-prototype mkv-prototype mcp-setup mcp-doctor
+.PHONY: all clean deploy deploy-one launch tools url-import-tools audio-bus-probe install-audio-bus-probe uninstall-audio-bus-probe symbols braw-prototype braw-raw-processor vp9-prototype mkv-prototype mcp-setup mcp-doctor
 
 all: $(OUTPUT)
 
@@ -423,7 +428,32 @@ parakeet-transcriber:
 		fi; \
 	else echo "  Skipped: $(PARAKEET_SRC_DIR) not found"; fi
 
+# Deploy the dylib into EVERY modded FCP edition found (standard, Creator Studio,
+# Trial). Build the shared artifacts once via prerequisites, then fan out to a
+# per-app `deploy-one`. If MODDED_APP was set explicitly on the command line
+# (e.g. `make deploy MODDED_APP=...`), honor just that one app instead.
 deploy: $(OUTPUT) $(SILENCE_DETECTOR) $(STRUCTURE_ANALYZER) $(MIXER_APP) vp9-prototype mkv-prototype whisper-transcriber parakeet-transcriber
+ifeq ($(origin MODDED_APP),command line)
+	@$(MAKE) deploy-one MODDED_APP="$(MODDED_APP)"
+else
+	@found=0; \
+	for a in $(MODDED_APP_CANDIDATES); do \
+		if [ -d "$$a" ]; then \
+			found=1; \
+			echo ""; \
+			echo ">>> Deploying into: $$a"; \
+			$(MAKE) deploy-one MODDED_APP="$$a" || exit 1; \
+		fi; \
+	done; \
+	if [ "$$found" = "0" ]; then \
+		echo "No modded FCP found under $(HOME)/Applications/SpliceKit/ — run the patcher first."; \
+		exit 1; \
+	fi
+endif
+
+# Deploy into a single app bundle ($(MODDED_APP)). Internal helper for `deploy`;
+# depends on $(OUTPUT) so direct invocation still has a built dylib to copy.
+deploy-one: $(OUTPUT)
 	@echo "=== Deploying SpliceKit to modded FCP ==="
 		@rm -rf "$(FW_DIR)"
 		@mkdir -p "$(FW_DIR)/Versions/A/Resources"

@@ -1814,14 +1814,25 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     // Get the media's timecode origin (unclippedRange.start) for coordinate conversion.
     // FCP stores times in the source media's timecode space, but external ASR tools
     // like Parakeet return file-relative timestamps starting from 0.
+    //
+    // CRITICAL: read the origin from the SAME object whose clippedRange produced
+    // trimStart — that is `timelineObject`, not `clip`. For a plain media component
+    // the two are identical. But for a synchronized-clip collection, `clip` is the
+    // INNER media component (unclippedRange in the source file's embedded time-of-day
+    // timecode space, e.g. ~50,348s for DJI footage), while trimStart came from the
+    // COLLECTION's clippedRange (zero-based internal timeline, e.g. 25.9s). Mixing the
+    // two spaces produces a large negative offset that gets clamped to 0, collapsing
+    // every bladed sync-clip piece to source offset 0 — transcribing the uncut start
+    // of the file instead of each clip's real range.
+    id originObject = timelineObject ?: clip;
     double mediaOrigin = 0;
     SEL ucSel = NSSelectorFromString(@"unclippedRange");
-    if ([clip respondsToSelector:ucSel]) {
-        NSMethodSignature *sig = [clip methodSignatureForSelector:ucSel];
+    if ([originObject respondsToSelector:ucSel]) {
+        NSMethodSignature *sig = [originObject methodSignatureForSelector:ucSel];
         if (sig && [sig methodReturnLength] == sizeof(SpliceKitTranscript_CMTimeRange)) {
             SpliceKitTranscript_CMTimeRange range;
             NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            [inv setTarget:clip];
+            [inv setTarget:originObject];
             [inv setSelector:ucSel];
             [inv invoke];
             [inv getReturnValue:&range];
