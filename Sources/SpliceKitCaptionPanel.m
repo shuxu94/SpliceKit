@@ -2179,15 +2179,26 @@ static void SpliceKit_installDragSpy(void) {
 }
 
 - (void)addMediaClip:(id)clip timelineObject:(id)timelineObject duration:(double)clipDuration atTimeline:(double)timelinePos into:(NSMutableArray *)clipInfos {
+    // The clip's in-point in source-media timecode space. Use clippedRange.start
+    // (the trimmed/visible range), NOT unclippedRange.start (the full-media origin,
+    // which is also captured separately as mediaOrigin). The transcriber decodes
+    // [trimStart - mediaOrigin, +duration] of the file, so trimStart must reflect
+    // where the visible portion begins. In FCP 11, bladed spine clips arrive as
+    // plain FFAnchoredMediaComponents (not collections); reading unclippedRange.start
+    // here made trimStart == mediaOrigin, collapsing every clip to source offset 0
+    // — so the whole timeline transcribed as the uncut start of the first clip.
     double trimStart = 0;
+    SEL clippedSel = NSSelectorFromString(@"clippedRange");
     SEL unclippedSel = NSSelectorFromString(@"unclippedRange");
-    if ([clip respondsToSelector:unclippedSel]) {
-        NSMethodSignature *sig = [clip methodSignatureForSelector:unclippedSel];
+    SEL rangeSel = [clip respondsToSelector:clippedSel] ? clippedSel
+                 : ([clip respondsToSelector:unclippedSel] ? unclippedSel : NULL);
+    if (rangeSel) {
+        NSMethodSignature *sig = [clip methodSignatureForSelector:rangeSel];
         if (sig && [sig methodReturnLength] == sizeof(SpliceKitCaption_CMTimeRange)) {
             SpliceKitCaption_CMTimeRange range;
             NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
             [inv setTarget:clip];
-            [inv setSelector:unclippedSel];
+            [inv setSelector:rangeSel];
             [inv invoke];
             [inv getReturnValue:&range];
             trimStart = SpliceKitCaption_CMTimeToSeconds(range.start);
