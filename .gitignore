@@ -64,3 +64,6 @@ edit-helper.yml
 
 # Claude Code per-project memory (never commit)
 .claude/
+
+# Codex per-project config (never commit)
+.codex/
