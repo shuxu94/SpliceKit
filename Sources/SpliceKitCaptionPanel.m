@@ -621,6 +621,9 @@ static SpliceKitCaptionAnimation SpliceKitCaption_animationFromName(NSString *na
 - (double)captionFrameDurationSeconds;
 - (NSArray<SpliceKitTranscriptWord *> *)normalizedCaptionWordsFromWords:(NSArray<SpliceKitTranscriptWord *> *)words
                                                                  context:(NSString *)context;
+- (double)captionRangeStart:(id)obj selector:(NSString *)selName;
+- (id)findAudioMediaDeep:(id)node depth:(int)depth;
+- (double)timelineStartOfMedia:(id)media insideContainer:(id)container depth:(int)depth;
 @end
 
 // Swizzle LKTileView's draggingEntered: to log what FCP receives during drags
@@ -2052,6 +2055,116 @@ static void SpliceKit_installDragSpy(void) {
     return @[];
 }
 
+- (double)captionRangeStart:(id)obj selector:(NSString *)selName {
+    if (!obj) return 0;
+    SEL sel = NSSelectorFromString(selName);
+    if (![obj respondsToSelector:sel]) return 0;
+    NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
+    if (!sig || [sig methodReturnLength] != sizeof(SpliceKitCaption_CMTimeRange)) return 0;
+    SpliceKitCaption_CMTimeRange range;
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:obj];
+    [inv setSelector:sel];
+    [inv invoke];
+    [inv getReturnValue:&range];
+    return SpliceKitCaption_CMTimeToSeconds(range.start);
+}
+
+- (BOOL)isAudioFileURL:(NSURL *)url {
+    static NSSet<NSString *> *audioExts;
+    if (!audioExts) {
+        audioExts = [NSSet setWithObjects:@"wav", @"wave", @"aif", @"aiff", @"aifc",
+            @"caf", @"mp3", @"m4a", @"aac", @"flac", nil];
+    }
+    return url && [audioExts containsObject:url.pathExtension.lowercaseString];
+}
+
+- (id)findAudioMediaDeep:(id)node depth:(int)depth {
+    if (!node || depth > 10) return nil;
+    NSString *cls = NSStringFromClass([node class]) ?: @"";
+    if ([cls containsString:@"MediaComponent"]) {
+        NSURL *url = [self getMediaURLForClip:node];
+        if ([self isAudioFileURL:url]) return node;
+    }
+
+    if ([node respondsToSelector:@selector(containedItems)]) {
+        id items = ((id (*)(id, SEL))objc_msgSend)(node, @selector(containedItems));
+        if ([items isKindOfClass:[NSArray class]]) {
+            for (id sub in (NSArray *)items) {
+                id found = [self findAudioMediaDeep:sub depth:depth + 1];
+                if (found) return found;
+            }
+        }
+    }
+
+    if ([node respondsToSelector:@selector(primaryObject)]) {
+        id primary = ((id (*)(id, SEL))objc_msgSend)(node, @selector(primaryObject));
+        if (primary && primary != node) {
+            id found = [self findAudioMediaDeep:primary depth:depth + 1];
+            if (found) return found;
+        }
+    }
+
+    for (id anchored in [self anchoredItemsForTimelineItem:node]) {
+        id found = [self findAudioMediaDeep:anchored depth:depth + 1];
+        if (found) return found;
+    }
+    return nil;
+}
+
+- (double)timelineStartOfMedia:(id)media insideContainer:(id)container depth:(int)depth {
+    if (!media || !container || depth > 10) return NAN;
+    if (media == container) return 0;
+
+    id primary = nil;
+    if ([container respondsToSelector:@selector(primaryObject)]) {
+        primary = ((id (*)(id, SEL))objc_msgSend)(container, @selector(primaryObject));
+    }
+
+    id rangeOwner = primary ?: container;
+    double directStart = 0;
+    double directDuration = 0;
+    if ([self effectiveRangeForTimelineObject:media
+                                primaryObject:rangeOwner
+                                        start:&directStart
+                                     duration:&directDuration]) {
+        return directStart;
+    }
+
+    double anchoredOffset = [self anchoredOffsetForTimelineObject:media];
+    if (anchoredOffset >= 0) return anchoredOffset;
+
+    NSMutableArray *children = [NSMutableArray array];
+    if ([container respondsToSelector:@selector(containedItems)]) {
+        id items = ((id (*)(id, SEL))objc_msgSend)(container, @selector(containedItems));
+        if ([items isKindOfClass:[NSArray class]]) [children addObjectsFromArray:(NSArray *)items];
+    }
+    if (primary && primary != container) [children addObject:primary];
+    [children addObjectsFromArray:[self anchoredItemsForTimelineItem:container]];
+
+    for (id child in children) {
+        if (child == media) return 0;
+        double childStart = 0;
+        double childDuration = 0;
+        BOOL hasChildStart = [self effectiveRangeForTimelineObject:child
+                                                     primaryObject:rangeOwner
+                                                             start:&childStart
+                                                          duration:&childDuration];
+        if (!hasChildStart) {
+            double childAnchored = [self anchoredOffsetForTimelineObject:child];
+            if (childAnchored >= 0) {
+                childStart = childAnchored;
+                hasChildStart = YES;
+            }
+        }
+
+        double nested = [self timelineStartOfMedia:media insideContainer:child depth:depth + 1];
+        if (isfinite(nested)) return (hasChildStart ? childStart : 0) + nested;
+    }
+
+    return NAN;
+}
+
 - (BOOL)effectiveRangeForTimelineObject:(id)item
                           primaryObject:(id)primaryObject
                                   start:(double *)startOut
@@ -2123,7 +2236,8 @@ static void SpliceKit_installDragSpy(void) {
         return;
     }
 
-    id innerMedia = [self findFirstMediaInContainer:item];
+    id innerMedia = [self findAudioMediaDeep:item depth:0];
+    if (!innerMedia) innerMedia = [self findFirstMediaInContainer:item];
     if (!innerMedia) return;
 
     double collTrimStart = 0;
@@ -2141,12 +2255,41 @@ static void SpliceKit_installDragSpy(void) {
         }
     }
 
+    double mediaSourceStart = [self captionRangeStart:innerMedia selector:@"clippedRange"];
+    double mediaOffsetInCollection = [self timelineStartOfMedia:innerMedia insideContainer:item depth:0];
+    if (!isfinite(mediaOffsetInCollection)) mediaOffsetInCollection = 0;
+
+    double sourceTrimStart = mediaSourceStart + MAX(0, collTrimStart - mediaOffsetInCollection);
+    double wordTimeOffset = MAX(0, mediaOffsetInCollection - collTrimStart);
+    double transcribeDuration = MAX(0, effectiveDuration - wordTimeOffset);
+    double mediaOrigin = [self captionRangeStart:innerMedia selector:@"unclippedRange"];
+
+    SpliceKit_log(@"[Captions] Sync/compound media mapping: container=%@ media=%@ collTrim=%.3f mediaOffset=%.3f mediaStart=%.3f origin=%.3f sourceTrim=%.3f wordOffset=%.3f transcribeDur=%.3f",
+                  className,
+                  NSStringFromClass([innerMedia class]) ?: @"",
+                  collTrimStart,
+                  mediaOffsetInCollection,
+                  mediaSourceStart,
+                  mediaOrigin,
+                  sourceTrimStart,
+                  wordTimeOffset,
+                  transcribeDuration);
+
+    NSUInteger beforeCount = clipInfos.count;
     [self addMediaClip:innerMedia
-          timelineObject:item
+          timelineObject:innerMedia
                duration:effectiveDuration
-              trimStart:collTrimStart
+              trimStart:sourceTrimStart
              atTimeline:timelineStart
                    into:clipInfos];
+    if (clipInfos.count > beforeCount) {
+        id added = [clipInfos lastObject];
+        if ([added isKindOfClass:[NSMutableDictionary class]]) {
+            NSMutableDictionary *info = (NSMutableDictionary *)added;
+            info[@"wordTimeOffset"] = @(wordTimeOffset);
+            info[@"transcribeDuration"] = @(transcribeDuration);
+        }
+    }
 }
 
 - (id)findFirstMediaInContainer:(id)container {
@@ -2637,12 +2780,15 @@ static NSData *SpliceKitWhisperServe_request(NSString *binaryPath, NSString *mod
         double trimStart = [clipInfo[@"trimStart"] doubleValue];
         double mediaOrigin = [clipInfo[@"mediaOrigin"] doubleValue];
         double clipDuration = [clipInfo[@"duration"] doubleValue];
+        double transcribeDuration = clipInfo[@"transcribeDuration"]
+            ? [clipInfo[@"transcribeDuration"] doubleValue] : clipDuration;
         double fileRelativeTrimStart = trimStart - mediaOrigin;
         if (fileRelativeTrimStart < 0) fileRelativeTrimStart = 0;
+        if (transcribeDuration <= 0) transcribeDuration = MIN(clipDuration, 0.05);
         [manifestEntries addObject:@{
             @"file": mediaURL.path,
             @"start": @(fileRelativeTrimStart),
-            @"duration": @(clipDuration),
+            @"duration": @(transcribeDuration),
         }];
     }
     NSData *manifestData = [NSJSONSerialization dataWithJSONObject:manifestEntries options:0 error:nil];
@@ -2853,6 +2999,7 @@ static NSData *SpliceKitWhisperServe_request(NSString *binaryPath, NSString *mod
         double timelineStart = [clipInfo[@"timelineStart"] doubleValue];
         double trimStart = [clipInfo[@"trimStart"] doubleValue];
         double clipDuration = [clipInfo[@"duration"] doubleValue];
+        double wordTimeOffset = clipInfo[@"wordTimeOffset"] ? [clipInfo[@"wordTimeOffset"] doubleValue] : 0;
         double mediaOrigin = [clipInfo[@"mediaOrigin"] doubleValue];
         NSString *clipHandle = clipInfo[@"handle"];
         double fileRelativeTrimStart = trimStart - mediaOrigin;
@@ -2881,14 +3028,14 @@ static NSData *SpliceKitWhisperServe_request(NSString *binaryPath, NSString *mod
             // Clamp to the clip so a word that slightly overruns the range edge
             // (Whisper can append trailing punctuation past the cut) stays inside.
             if (startTime < 0) startTime = 0;
-            if (startTime >= clipDuration) continue;
+            if (startTime + wordTimeOffset >= clipDuration) continue;
             double dur = endTime - startTime;
             if (dur <= 0) dur = 1.0 / 30.0;
-            dur = MIN(dur, clipDuration - startTime);
+            dur = MIN(dur, clipDuration - wordTimeOffset - startTime);
 
             SpliceKitTranscriptWord *word = [[SpliceKitTranscriptWord alloc] init];
             word.text = text;
-            word.startTime = timelineStart + startTime;
+            word.startTime = timelineStart + wordTimeOffset + startTime;
             word.duration = dur;
             word.endTime = word.startTime + word.duration;
             word.confidence = confidence;
@@ -4133,35 +4280,23 @@ static id SpliceKitCaption_subChannel(id parentChannel, NSString *axis) {
     return ((id (*)(id, SEL))objc_msgSend)(parentChannel, selector);
 }
 
-static BOOL SpliceKitCaption_applyTransformToTitle(id titleObject, CGFloat yOffset, CGFloat scalePercent) {
-    if (!titleObject) return NO;
+static BOOL SpliceKitCaption_saveChannelToEffectValues(id effect, id channel, BOOL writeDescendants) {
+    if (!effect || !channel) return NO;
 
     @try {
-        Class cutawayEffects = objc_getClass("FFCutawayEffects");
-        if (!cutawayEffects) return NO;
+        SEL ozSel = NSSelectorFromString(@"ozChannel");
+        SEL saveSel = NSSelectorFromString(@"saveDataForChannel:writeDescendants:");
+        if (![channel respondsToSelector:ozSel] || ![effect respondsToSelector:saveSel]) {
+            return NO;
+        }
 
-        SEL transformSel = NSSelectorFromString(@"transformEffectForObject:createIfAbsent:");
-        if (![cutawayEffects respondsToSelector:transformSel]) return NO;
+        void *ozChannel = ((void *(*)(id, SEL))objc_msgSend)(channel, ozSel);
+        if (!ozChannel) return NO;
 
-        id xformEffect = ((id (*)(id, SEL, id, BOOL))objc_msgSend)(
-            cutawayEffects, transformSel, titleObject, YES);
-        if (!xformEffect) return NO;
-
-        id position3D = [xformEffect respondsToSelector:NSSelectorFromString(@"positionChannel3D")]
-            ? ((id (*)(id, SEL))objc_msgSend)(xformEffect, NSSelectorFromString(@"positionChannel3D"))
-            : nil;
-        id scale3D = [xformEffect respondsToSelector:NSSelectorFromString(@"scaleChannel3D")]
-            ? ((id (*)(id, SEL))objc_msgSend)(xformEffect, NSSelectorFromString(@"scaleChannel3D"))
-            : nil;
-
-        BOOL changed = NO;
-        changed |= SpliceKitCaption_setChannelDouble(SpliceKitCaption_subChannel(position3D, @"x"), 0.0);
-        changed |= SpliceKitCaption_setChannelDouble(SpliceKitCaption_subChannel(position3D, @"y"), yOffset);
-        changed |= SpliceKitCaption_setChannelDouble(SpliceKitCaption_subChannel(scale3D, @"x"), scalePercent);
-        changed |= SpliceKitCaption_setChannelDouble(SpliceKitCaption_subChannel(scale3D, @"y"), scalePercent);
-        return changed;
+        ((void (*)(id, SEL, void *, BOOL))objc_msgSend)(effect, saveSel, ozChannel, writeDescendants);
+        return YES;
     } @catch (NSException *e) {
-        SpliceKit_log(@"[Captions] Failed to apply title transform: %@", e.reason);
+        SpliceKit_log(@"[Captions] Failed to save channel to effect values: %@", e.reason);
     }
     return NO;
 }
@@ -4191,7 +4326,33 @@ static BOOL SpliceKitCaption_applyGeneratorPositionYOffset(id titleObject, CGFlo
                         ? ((id (*)(id, SEL))objc_msgSend)(parent, NSSelectorFromString(@"name")) : nil;
                     if ([parentName isEqualToString:@"Transform"]) {
                         id yChannel = SpliceKitCaption_subChannel(node, @"y");
-                        return yChannel ? SpliceKitCaption_setChannelDouble(yChannel, yOffset) : NO;
+                        id xChannel = SpliceKitCaption_subChannel(node, @"x");
+                        BOOL changed = NO;
+                        changed |= SpliceKitCaption_setChannelDouble(xChannel, 0.0);
+                        changed |= SpliceKitCaption_setChannelDouble(yChannel, yOffset);
+                        if (changed) {
+                            BOOL savedPosition = SpliceKitCaption_saveChannelToEffectValues(effect, node, YES);
+                            SpliceKit_log(@"[Captions] Saved generator position channel to effect values: %@ y=%.1f",
+                                          savedPosition ? @"YES" : @"NO", yOffset);
+
+                            SEL syncXMLSel = NSSelectorFromString(@"syncChannelStateForXMLExport");
+                            SEL saveSel = NSSelectorFromString(@"saveDirtyTextToEffectValues");
+                            SEL finishedSel = NSSelectorFromString(@"finishedSettingEffectParameters");
+                            if ([effect respondsToSelector:syncXMLSel]) {
+                                ((void (*)(id, SEL))objc_msgSend)(effect, syncXMLSel);
+                                SpliceKit_log(@"[Captions] Synced generator position for XML/export y=%.1f", yOffset);
+                            }
+                            if ([effect respondsToSelector:saveSel]) {
+                                ((void (*)(id, SEL))objc_msgSend)(effect, saveSel);
+                                SpliceKit_log(@"[Captions] Saved generator position effect values y=%.1f", yOffset);
+                            }
+                            if ([effect respondsToSelector:finishedSel]) {
+                                ((void (*)(id, SEL))objc_msgSend)(effect, finishedSel);
+                            }
+                            SpliceKitCaption_notifyEffectChannelChanged(effect, yChannel ?: xChannel, NO);
+                            SpliceKitCaption_scheduleEffectTextRefreshPulses(effect, NO);
+                        }
+                        return changed;
                     }
                 }
             }
@@ -4205,7 +4366,7 @@ static BOOL SpliceKitCaption_applyGeneratorPositionYOffset(id titleObject, CGFlo
             }
         }
     } @catch (NSException *e) {
-        SpliceKit_log(@"[Captions] Failed to restore generator position: %@", e.reason);
+        SpliceKit_log(@"[Captions] Failed to apply generator position: %@", e.reason);
     }
 
     return NO;
@@ -4296,6 +4457,8 @@ static BOOL SpliceKitCaption_pollMainThread(BOOL (^condition)(void), double time
 
     SpliceKitCaptionStyle *s = self.style;
     int fdN = self.fdNum, fdD = self.fdDen;
+    CGFloat yOffset = [self yOffsetForStyle:s];
+    BOOL needsPosition = (s.position != SpliceKitCaptionPositionCenter || s.customYOffset != 0);
 
     // Verify a timeline is open
     __block BOOL hasTimeline = NO;
@@ -4340,6 +4503,10 @@ static BOOL SpliceKitCaption_pollMainThread(BOOL (^condition)(void), double time
         @"segmentCount": @(self.mutableSegments.count),
         @"segments": segmentDebug,
     } mutableCopy];
+    debugInfo[@"position"] = @{
+        @"yOffset": @(yOffset),
+        @"needsPosition": @(needsPosition),
+    };
     NSArray<NSDictionary *> *runtimeEntries = [self runtimeEntriesForStyle:s];
     debugInfo[@"expectedTextCount"] = @(runtimeEntries.count);
     debugInfo[@"runtimeEntryCount"] = @(runtimeEntries.count);
@@ -4497,6 +4664,16 @@ static BOOL SpliceKitCaption_pollMainThread(BOOL (^condition)(void), double time
                 SpliceKit_log(@"[Captions][Native] Runtime entry segment=%lu generator=%@",
                               (unsigned long)(seg ? seg.segmentIndex : segIndex),
                               SpliceKitCaption_describeObject(generator));
+
+                if (needsPosition) {
+                    BOOL preAppliedPosition = SpliceKitCaption_applyGeneratorPositionYOffset(generator, yOffset);
+                    segInfo[@"positionYOffset"] = @(yOffset);
+                    segInfo[@"positionAppliedBeforeArchive"] = @(preAppliedPosition);
+                    if (!preAppliedPosition) {
+                        SpliceKit_log(@"[Captions][Native] Runtime entry segment=%lu could not apply generator position before archive",
+                                      (unsigned long)(seg ? seg.segmentIndex : segIndex));
+                    }
+                }
 
                 ((void (*)(id, SEL, id))objc_msgSend)(storyline, addContainedSel, generator);
                 cursorFrames = startFrames + durationFrames;
@@ -4660,8 +4837,6 @@ static BOOL SpliceKitCaption_pollMainThread(BOOL (^condition)(void), double time
     __block NSUInteger anchoredContainerCount = 0;
     __block NSUInteger textAppliedCount = 0;
     __block NSUInteger textSegmentCursor = 0;
-    CGFloat yOffset = [self yOffsetForStyle:s];
-    BOOL needsPosition = (s.position != SpliceKitCaptionPositionCenter || s.customYOffset != 0);
 
     if (pasteHandled) {
         SpliceKit_executeOnMainThread(^{
