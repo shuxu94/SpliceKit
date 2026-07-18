@@ -6954,7 +6954,14 @@ static NSDictionary *SpliceKit_handleCaptionsGetStyles(NSDictionary *params) {
 }
 
 static NSDictionary *SpliceKit_handleCaptionsSetStyle(NSDictionary *params) {
-    NSString *presetID = params[@"presetID"];
+    NSMutableDictionary *normalizedParams = [params mutableCopy];
+    id yOffset = normalizedParams[@"customYOffset"] ?: normalizedParams[@"positionY"] ?: normalizedParams[@"position_y"];
+    if (yOffset) {
+        normalizedParams[@"customYOffset"] = yOffset;
+        normalizedParams[@"position"] = @"custom";
+    }
+
+    NSString *presetID = normalizedParams[@"presetID"];
     SpliceKitCaptionStyle *style = nil;
 
     if (presetID) {
@@ -6962,12 +6969,12 @@ static NSDictionary *SpliceKit_handleCaptionsSetStyle(NSDictionary *params) {
         if (!style) return @{@"error": [NSString stringWithFormat:@"Unknown preset: %@", presetID]};
         // Merge all params as overrides on top of the preset
         NSMutableDictionary *merged = [[style toDictionary] mutableCopy];
-        for (NSString *key in params) {
-            if (![key isEqualToString:@"presetID"]) merged[key] = params[key];
+        for (NSString *key in normalizedParams) {
+            if (![key isEqualToString:@"presetID"]) merged[key] = normalizedParams[key];
         }
         style = [SpliceKitCaptionStyle fromDictionary:merged];
     } else {
-        style = [SpliceKitCaptionStyle fromDictionary:params];
+        style = [SpliceKitCaptionStyle fromDictionary:normalizedParams];
     }
 
     [[SpliceKitCaptionPanel sharedPanel] setStyle:style];
@@ -6995,29 +7002,42 @@ static NSDictionary *SpliceKit_handleCaptionsGenerate(NSDictionary *params) {
     SpliceKitCaptionPanel *panel = [SpliceKitCaptionPanel sharedPanel];
 
     // Support one-shot: set style + grouping + generate in one call
-    if (params[@"style"] || params[@"presetID"]) {
-        NSString *pid = params[@"style"] ?: params[@"presetID"];
-        SpliceKitCaptionStyle *style = [SpliceKitCaptionStyle presetWithID:pid];
-        if (style) {
-            // Apply overrides via serialization round-trip.
-            // Map MCP param names to style dict keys.
-            NSDictionary *keyMap = @{
-                @"word_highlight": @"wordByWordHighlight",
-                @"all_caps": @"allCaps",
-                @"font_size": @"fontSize",
-                @"font_face": @"fontFace",
-                @"outline_width": @"outlineWidth",
-            };
-            NSMutableDictionary *merged = [[style toDictionary] mutableCopy];
-            for (NSString *key in params) {
-                if ([key isEqualToString:@"style"] || [key isEqualToString:@"presetID"] ||
-                    [key isEqualToString:@"maxWords"]) continue;
-                NSString *mappedKey = keyMap[key] ?: key;
-                merged[mappedKey] = params[key];
-            }
-            style = [SpliceKitCaptionStyle fromDictionary:merged];
-            [panel setStyle:style];
+    NSDictionary *keyMap = @{
+        @"word_highlight": @"wordByWordHighlight",
+        @"all_caps": @"allCaps",
+        @"font_size": @"fontSize",
+        @"font_face": @"fontFace",
+        @"outline_width": @"outlineWidth",
+        @"position_y": @"customYOffset",
+        @"positionY": @"customYOffset",
+    };
+    BOOL hasCustomY = (params[@"customYOffset"] || params[@"positionY"] || params[@"position_y"]);
+    BOOL hasStyleParams = NO;
+    for (NSString *key in params) {
+        if (![key isEqualToString:@"maxWords"]) {
+            hasStyleParams = YES;
+            break;
         }
+    }
+
+    if (hasStyleParams) {
+        SpliceKitCaptionStyle *style = [panel currentStyle];
+        NSString *pid = params[@"style"] ?: params[@"presetID"];
+        if (pid) {
+            SpliceKitCaptionStyle *presetStyle = [SpliceKitCaptionStyle presetWithID:pid];
+            if (presetStyle) style = presetStyle;
+        }
+
+        NSMutableDictionary *merged = [[style toDictionary] mutableCopy];
+        for (NSString *key in params) {
+            if ([key isEqualToString:@"style"] || [key isEqualToString:@"presetID"] ||
+                [key isEqualToString:@"maxWords"]) continue;
+            NSString *mappedKey = keyMap[key] ?: key;
+            merged[mappedKey] = params[key];
+        }
+        if (hasCustomY) merged[@"position"] = @"custom";
+        style = [SpliceKitCaptionStyle fromDictionary:merged];
+        [panel setStyle:style];
     }
     if (params[@"maxWords"]) {
         panel.maxWordsPerSegment = [params[@"maxWords"] unsignedIntegerValue];
@@ -7051,6 +7071,13 @@ static NSDictionary *SpliceKit_handleCaptionsSetWords(NSDictionary *params) {
         return @{@"error": @"words array required"};
     [[SpliceKitCaptionPanel sharedPanel] setWordsManually:wordDicts];
     return @{@"status": @"ok", @"wordCount": @(wordDicts.count)};
+}
+
+static NSDictionary *SpliceKit_handleCaptionsSetTranscriptText(NSDictionary *params) {
+    NSString *text = params[@"text"];
+    if (![text isKindOfClass:[NSString class]])
+        return @{@"error": @"text parameter required"};
+    return [[SpliceKitCaptionPanel sharedPanel] setTranscriptText:text];
 }
 
 static NSDictionary *SpliceKit_handleCaptionsSetXML(NSDictionary *params) {
@@ -27805,6 +27832,8 @@ NSDictionary *SpliceKit_handleRequest(NSDictionary *request) {
         result = SpliceKit_handleCaptionsExportTXT(params);
     } else if ([method isEqualToString:@"captions.setWords"]) {
         result = SpliceKit_handleCaptionsSetWords(params);
+    } else if ([method isEqualToString:@"captions.setTranscriptText"]) {
+        result = SpliceKit_handleCaptionsSetTranscriptText(params);
     } else if ([method isEqualToString:@"captions.setXML"]) {
         result = SpliceKit_handleCaptionsSetXML(params);
     } else if ([method isEqualToString:@"captions.verify"]) {

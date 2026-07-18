@@ -42,9 +42,21 @@ NSNotificationName const SpliceKitCaptionDidGenerateNotification = @"SpliceKitCa
 - (BOOL)isFlipped { return YES; }
 @end
 
+@interface SpliceKitCaptionTranscriptTextView : NSTextView
+@end
+@implementation SpliceKitCaptionTranscriptTextView
+- (void)changeColor:(id)sender {
+    self.textColor = [NSColor whiteColor];
+    self.insertionPointColor = [NSColor whiteColor];
+}
+@end
+
 // Forward declare properties for panel UI
 @interface SpliceKitCaptionPanel ()
 @property (nonatomic, strong) NSTextField *statusLabel;
+@property (nonatomic, strong) NSTextView *transcriptTextView;
+@property (nonatomic, strong) NSTextField *transcriptMetaLabel;
+@property (nonatomic, strong) NSButton *applyTranscriptButton;
 @end
 
 extern id SpliceKit_getActiveTimelineModule(void);
@@ -592,6 +604,8 @@ static SpliceKitCaptionAnimation SpliceKitCaption_animationFromName(NSString *na
 @property (nonatomic, strong) NSColorWell *shadowColorWell;
 @property (nonatomic, strong) NSSlider *shadowBlurSlider;
 @property (nonatomic, strong) NSPopUpButton *positionPopup;
+@property (nonatomic, strong) NSSlider *positionYSlider;
+@property (nonatomic, strong) NSTextField *positionYField;
 @property (nonatomic, strong) NSPopUpButton *animationPopup;
 @property (nonatomic, strong) NSButton *allCapsCheckbox;
 @property (nonatomic, strong) NSButton *wordHighlightCheckbox;
@@ -1024,10 +1038,41 @@ static void SpliceKit_installDragSpy(void) {
     self.positionPopup = [[NSPopUpButton alloc] init];
     self.positionPopup.translatesAutoresizingMaskIntoConstraints = NO;
     self.positionPopup.controlSize = NSControlSizeSmall;
-    [self.positionPopup addItemsWithTitles:@[@"Bottom", @"Center", @"Top"]];
+    [self.positionPopup addItemsWithTitles:@[@"Bottom", @"Center", @"Top", @"Custom"]];
     self.positionPopup.target = self; self.positionPopup.action = @selector(positionChanged:);
     [docView addSubview:self.positionPopup];
-    [self layoutRow:posLabel control:self.positionPopup in:docView below:prev pad:pad rowH:rowH];
+
+    self.positionYSlider = [[NSSlider alloc] init];
+    self.positionYSlider.translatesAutoresizingMaskIntoConstraints = NO;
+    self.positionYSlider.minValue = -1080;
+    self.positionYSlider.maxValue = 1080;
+    self.positionYSlider.doubleValue = 0;
+    self.positionYSlider.controlSize = NSControlSizeSmall;
+    self.positionYSlider.target = self; self.positionYSlider.action = @selector(positionYChanged:);
+    [docView addSubview:self.positionYSlider];
+
+    self.positionYField = [[NSTextField alloc] init];
+    self.positionYField.translatesAutoresizingMaskIntoConstraints = NO;
+    self.positionYField.font = [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular];
+    self.positionYField.alignment = NSTextAlignmentCenter;
+    self.positionYField.controlSize = NSControlSizeSmall;
+    self.positionYField.target = self; self.positionYField.action = @selector(positionYChanged:);
+    [docView addSubview:self.positionYField];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [posLabel.topAnchor constraintEqualToAnchor:prev.bottomAnchor constant:8],
+        [posLabel.leadingAnchor constraintEqualToAnchor:docView.leadingAnchor constant:pad],
+        [posLabel.widthAnchor constraintEqualToConstant:80],
+        [self.positionPopup.centerYAnchor constraintEqualToAnchor:posLabel.centerYAnchor],
+        [self.positionPopup.leadingAnchor constraintEqualToAnchor:posLabel.trailingAnchor constant:4],
+        [self.positionPopup.widthAnchor constraintEqualToConstant:92],
+        [self.positionYSlider.centerYAnchor constraintEqualToAnchor:posLabel.centerYAnchor],
+        [self.positionYSlider.leadingAnchor constraintEqualToAnchor:self.positionPopup.trailingAnchor constant:6],
+        [self.positionYSlider.trailingAnchor constraintEqualToAnchor:self.positionYField.leadingAnchor constant:-6],
+        [self.positionYField.centerYAnchor constraintEqualToAnchor:posLabel.centerYAnchor],
+        [self.positionYField.trailingAnchor constraintEqualToAnchor:docView.trailingAnchor constant:-pad],
+        [self.positionYField.widthAnchor constraintEqualToConstant:58],
+    ]];
     prev = posLabel;
 
     // === ANIMATION ===
@@ -1106,6 +1151,68 @@ static void SpliceKit_installDragSpy(void) {
         [gpSuffix.leadingAnchor constraintEqualToAnchor:self.groupingValueField.trailingAnchor constant:4],
     ]];
     prev = groupLabel;
+
+    // === TRANSCRIPT EDITOR ===
+    NSTextField *transcriptLabel = [self makeLabel:@"Transcript"];
+    [docView addSubview:transcriptLabel];
+
+    NSScrollView *transcriptScrollView = [[NSScrollView alloc] init];
+    transcriptScrollView.translatesAutoresizingMaskIntoConstraints = NO;
+    transcriptScrollView.hasVerticalScroller = YES;
+    transcriptScrollView.hasHorizontalScroller = NO;
+    transcriptScrollView.borderType = NSBezelBorder;
+    transcriptScrollView.drawsBackground = YES;
+    transcriptScrollView.backgroundColor = [NSColor textBackgroundColor];
+    [docView addSubview:transcriptScrollView];
+
+    self.transcriptTextView = [[SpliceKitCaptionTranscriptTextView alloc] initWithFrame:NSMakeRect(0, 0, 100, 100)];
+    self.transcriptTextView.editable = YES;
+    self.transcriptTextView.selectable = YES;
+    self.transcriptTextView.richText = NO;
+    self.transcriptTextView.importsGraphics = NO;
+    self.transcriptTextView.automaticQuoteSubstitutionEnabled = NO;
+    self.transcriptTextView.automaticDashSubstitutionEnabled = NO;
+    self.transcriptTextView.font = [NSFont systemFontOfSize:12];
+    self.transcriptTextView.textColor = [NSColor whiteColor];
+    self.transcriptTextView.insertionPointColor = [NSColor whiteColor];
+    self.transcriptTextView.backgroundColor = [NSColor colorWithCalibratedWhite:0.08 alpha:1];
+    self.transcriptTextView.typingAttributes = @{
+        NSForegroundColorAttributeName: [NSColor whiteColor],
+        NSFontAttributeName: self.transcriptTextView.font ?: [NSFont systemFontOfSize:12],
+    };
+    self.transcriptTextView.textContainerInset = NSMakeSize(6, 6);
+    self.transcriptTextView.minSize = NSMakeSize(0, 0);
+    self.transcriptTextView.maxSize = NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX);
+    self.transcriptTextView.verticallyResizable = YES;
+    self.transcriptTextView.horizontallyResizable = NO;
+    self.transcriptTextView.autoresizingMask = NSViewWidthSizable;
+    self.transcriptTextView.textContainer.widthTracksTextView = YES;
+    transcriptScrollView.documentView = self.transcriptTextView;
+
+    self.transcriptMetaLabel = [self makeTinyLabel:@"No transcript loaded"];
+    [docView addSubview:self.transcriptMetaLabel];
+
+    self.applyTranscriptButton = [NSButton buttonWithTitle:@"Apply Edits" target:self action:@selector(applyTranscriptClicked:)];
+    self.applyTranscriptButton.translatesAutoresizingMaskIntoConstraints = NO;
+    self.applyTranscriptButton.bezelStyle = NSBezelStyleRounded;
+    self.applyTranscriptButton.font = [NSFont systemFontOfSize:11];
+    [docView addSubview:self.applyTranscriptButton];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [transcriptLabel.topAnchor constraintEqualToAnchor:prev.bottomAnchor constant:10],
+        [transcriptLabel.leadingAnchor constraintEqualToAnchor:docView.leadingAnchor constant:pad],
+        [transcriptLabel.widthAnchor constraintEqualToConstant:80],
+        [transcriptScrollView.topAnchor constraintEqualToAnchor:transcriptLabel.topAnchor],
+        [transcriptScrollView.leadingAnchor constraintEqualToAnchor:transcriptLabel.trailingAnchor constant:4],
+        [transcriptScrollView.trailingAnchor constraintEqualToAnchor:docView.trailingAnchor constant:-pad],
+        [transcriptScrollView.heightAnchor constraintEqualToConstant:120],
+        [self.transcriptMetaLabel.topAnchor constraintEqualToAnchor:transcriptScrollView.bottomAnchor constant:4],
+        [self.transcriptMetaLabel.leadingAnchor constraintEqualToAnchor:transcriptScrollView.leadingAnchor],
+        [self.transcriptMetaLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.applyTranscriptButton.leadingAnchor constant:-8],
+        [self.applyTranscriptButton.centerYAnchor constraintEqualToAnchor:self.transcriptMetaLabel.centerYAnchor],
+        [self.applyTranscriptButton.trailingAnchor constraintEqualToAnchor:docView.trailingAnchor constant:-pad],
+    ]];
+    prev = self.transcriptMetaLabel;
 
     // === SEPARATOR ===
     NSBox *sep2 = [[NSBox alloc] init]; sep2.boxType = NSBoxSeparator;
@@ -1218,6 +1325,29 @@ static void SpliceKit_installDragSpy(void) {
     ]];
 }
 
+- (CGFloat)resolvedPositionYForStyle:(SpliceKitCaptionStyle *)style {
+    SpliceKitCaptionStyle *s = style ?: self.style;
+    switch (s.position) {
+        case SpliceKitCaptionPositionBottom: return -(self.videoHeight * 0.32);
+        case SpliceKitCaptionPositionCenter: return 0;
+        case SpliceKitCaptionPositionTop: return (self.videoHeight * 0.32);
+        case SpliceKitCaptionPositionCustom: return s.customYOffset;
+    }
+    return 0;
+}
+
+- (void)syncPositionValueControls {
+    if (!self.positionYSlider || !self.positionYField) return;
+
+    CGFloat limit = MAX((CGFloat)self.videoHeight, 1080.0);
+    self.positionYSlider.minValue = -limit;
+    self.positionYSlider.maxValue = limit;
+
+    CGFloat y = [self resolvedPositionYForStyle:self.style];
+    self.positionYSlider.doubleValue = MIN(MAX(y, self.positionYSlider.minValue), self.positionYSlider.maxValue);
+    self.positionYField.stringValue = [NSString stringWithFormat:@"%.0f", y];
+}
+
 - (void)syncUIFromStyle {
     if (!self.panel) return;
     SpliceKitCaptionStyle *s = self.style;
@@ -1249,6 +1379,7 @@ static void SpliceKit_installDragSpy(void) {
 
     // Popups
     [self.positionPopup selectItemAtIndex:(NSInteger)s.position];
+    [self syncPositionValueControls];
     [self.animationPopup selectItemAtIndex:(NSInteger)s.animation];
 
     // Checkboxes
@@ -1363,7 +1494,23 @@ static void SpliceKit_installDragSpy(void) {
 }
 - (void)outlineWidthChanged:(id)sender { self.style.outlineWidth = self.outlineWidthSlider.doubleValue; [self updatePreview]; [self persistCaptionDraftStateForCurrentSequence]; }
 - (void)shadowBlurChanged:(id)sender { self.style.shadowBlurRadius = self.shadowBlurSlider.doubleValue; [self updatePreview]; [self persistCaptionDraftStateForCurrentSequence]; }
-- (void)positionChanged:(id)sender { self.style.position = (SpliceKitCaptionPosition)self.positionPopup.indexOfSelectedItem; [self persistCaptionDraftStateForCurrentSequence]; }
+- (void)positionChanged:(id)sender {
+    SpliceKitCaptionPosition position = (SpliceKitCaptionPosition)self.positionPopup.indexOfSelectedItem;
+    self.style.position = position;
+    if (position == SpliceKitCaptionPositionCustom) {
+        self.style.customYOffset = self.positionYField.doubleValue;
+    }
+    [self syncPositionValueControls];
+    [self persistCaptionDraftStateForCurrentSequence];
+}
+- (void)positionYChanged:(id)sender {
+    double y = (sender == self.positionYSlider) ? self.positionYSlider.doubleValue : self.positionYField.doubleValue;
+    self.style.position = SpliceKitCaptionPositionCustom;
+    self.style.customYOffset = y;
+    [self.positionPopup selectItemAtIndex:(NSInteger)SpliceKitCaptionPositionCustom];
+    [self syncPositionValueControls];
+    [self persistCaptionDraftStateForCurrentSequence];
+}
 - (void)animationChanged:(id)sender { self.style.animation = (SpliceKitCaptionAnimation)self.animationPopup.indexOfSelectedItem; [self persistCaptionDraftStateForCurrentSequence]; }
 - (void)capsToggled:(id)sender { self.style.allCaps = (self.allCapsCheckbox.state == NSControlStateValueOn); [self updatePreview]; [self persistCaptionDraftStateForCurrentSequence]; }
 - (void)highlightToggled:(id)sender { self.style.wordByWordHighlight = (self.wordHighlightCheckbox.state == NSControlStateValueOn); [self updatePreview]; [self persistCaptionDraftStateForCurrentSequence]; }
@@ -1372,6 +1519,194 @@ static void SpliceKit_installDragSpy(void) {
     self.groupingMode = (SpliceKitCaptionGrouping)self.groupingPopup.indexOfSelectedItem;
     if (self.mutableWords.count > 0) [self regroupSegments];
     [self persistCaptionDraftStateForCurrentSequence];
+}
+
+- (NSArray<NSString *> *)captionTokensFromTranscriptText:(NSString *)text {
+    NSCharacterSet *splitSet = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    NSMutableArray<NSString *> *tokens = [NSMutableArray array];
+    for (NSString *part in [text ?: @"" componentsSeparatedByCharactersInSet:splitSet]) {
+        NSString *trimmed = [part stringByTrimmingCharactersInSet:splitSet];
+        if (trimmed.length > 0) [tokens addObject:trimmed];
+    }
+    return tokens;
+}
+
+- (SpliceKitTranscriptWord *)copyCaptionWord:(SpliceKitTranscriptWord *)source
+                                        text:(NSString *)text
+                                       start:(double)start
+                                         end:(double)end
+                                       index:(NSUInteger)index {
+    SpliceKitTranscriptWord *word = [[SpliceKitTranscriptWord alloc] init];
+    word.text = text ?: @"";
+    word.startTime = start;
+    word.endTime = end;
+    word.duration = MAX(end - start, [self captionFrameDurationSeconds]);
+    word.confidence = source ? source.confidence : 1.0;
+    word.wordIndex = index;
+    word.speaker = source.speaker ?: @"Unknown";
+    word.clipHandle = source.clipHandle;
+    word.clipTimelineStart = source ? source.clipTimelineStart : start;
+    word.sourceMediaOffset = source ? source.sourceMediaOffset : 0;
+    word.sourceMediaTime = source ? source.sourceMediaTime : start;
+    word.sourceMediaPath = source.sourceMediaPath;
+    return word;
+}
+
+- (NSString *)editableTranscriptText {
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    @synchronized (self.mutableWords) {
+        for (SpliceKitTranscriptWord *word in self.mutableWords) {
+            NSString *text = [word.text ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (text.length > 0) [parts addObject:text];
+        }
+    }
+    return [parts componentsJoinedByString:@" "];
+}
+
+- (void)updateTranscriptEditorFromWords {
+    if (!self.panel || !self.transcriptTextView) return;
+
+    void (^updateBlock)(void) = ^{
+        NSString *text = [self editableTranscriptText];
+        self.transcriptTextView.string = text ?: @"";
+        self.transcriptTextView.textColor = [NSColor whiteColor];
+        self.transcriptTextView.insertionPointColor = [NSColor whiteColor];
+        self.transcriptTextView.typingAttributes = @{
+            NSForegroundColorAttributeName: [NSColor whiteColor],
+            NSFontAttributeName: self.transcriptTextView.font ?: [NSFont systemFontOfSize:12],
+        };
+        if (self.transcriptMetaLabel) {
+            self.transcriptMetaLabel.stringValue = self.mutableWords.count > 0
+                ? [NSString stringWithFormat:@"%lu words, %lu segments",
+                    (unsigned long)self.mutableWords.count, (unsigned long)self.mutableSegments.count]
+                : @"No transcript loaded";
+        }
+    };
+
+    if ([NSThread isMainThread]) updateBlock();
+    else dispatch_async(dispatch_get_main_queue(), updateBlock);
+}
+
+- (NSDictionary *)setTranscriptText:(NSString *)text {
+    NSString *trimmedText = [text ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSArray<NSString *> *tokens = [self captionTokensFromTranscriptText:trimmedText];
+    if (tokens.count == 0) return @{@"error": @"Transcript text is empty"};
+
+    NSArray<SpliceKitTranscriptWord *> *existingWords = nil;
+    @synchronized (self.mutableWords) {
+        existingWords = [self.mutableWords copy];
+    }
+
+    if (existingWords.count == 0) {
+        return @{@"error": @"No timed words to edit — transcribe first or use captions.setWords"};
+    }
+
+    NSMutableArray<SpliceKitTranscriptWord *> *editedWords = [NSMutableArray arrayWithCapacity:tokens.count];
+    double frameDuration = [self captionFrameDurationSeconds];
+
+    if (tokens.count == existingWords.count) {
+        for (NSUInteger i = 0; i < tokens.count; i++) {
+            SpliceKitTranscriptWord *source = existingWords[i];
+            [editedWords addObject:[self copyCaptionWord:source
+                                                   text:tokens[i]
+                                                  start:source.startTime
+                                                    end:source.endTime
+                                                  index:i]];
+        }
+    } else {
+        SpliceKitTranscriptWord *first = existingWords.firstObject;
+        SpliceKitTranscriptWord *last = existingWords.lastObject;
+        double totalStart = first.startTime;
+        double totalEnd = last.endTime;
+        double totalDuration = totalEnd - totalStart;
+        if (!isfinite(totalDuration) || totalDuration <= 0) {
+            totalDuration = MAX((double)tokens.count * frameDuration, frameDuration);
+            totalEnd = totalStart + totalDuration;
+        }
+
+        double totalWeight = 0;
+        for (NSString *token in tokens) totalWeight += MAX((double)token.length, 1.0);
+        if (totalWeight <= 0) totalWeight = (double)tokens.count;
+
+        double consumedWeight = 0;
+        double cursor = totalStart;
+        for (NSUInteger i = 0; i < tokens.count; i++) {
+            consumedWeight += MAX((double)tokens[i].length, 1.0);
+            double end = (i + 1 == tokens.count)
+                ? totalEnd
+                : totalStart + (totalDuration * consumedWeight / totalWeight);
+            if (!isfinite(end) || end <= cursor) end = cursor + frameDuration;
+
+            double sourcePosition = ((double)i + 0.5) / (double)tokens.count;
+            NSUInteger sourceIndex = (NSUInteger)floor(sourcePosition * (double)existingWords.count);
+            if (sourceIndex >= existingWords.count) sourceIndex = existingWords.count - 1;
+            SpliceKitTranscriptWord *source = existingWords[sourceIndex];
+            [editedWords addObject:[self copyCaptionWord:source
+                                                   text:tokens[i]
+                                                  start:cursor
+                                                    end:end
+                                                  index:i]];
+            cursor = end;
+        }
+    }
+
+    NSArray<SpliceKitTranscriptWord *> *normalizedWords =
+        [self normalizedCaptionWordsFromWords:editedWords context:@"Edited caption transcript"];
+    @synchronized (self.mutableWords) {
+        [self.mutableWords removeAllObjects];
+        [self.mutableWords addObjectsFromArray:normalizedWords];
+    }
+
+    self.status = SpliceKitCaptionStatusReady;
+    self.errorMessage = nil;
+    [self regroupSegments];
+    [self persistCaptionDraftStateForCurrentSequence];
+    [self updateTranscriptEditorFromWords];
+
+    NSString *message = [NSString stringWithFormat:@"Applied transcript edits: %lu words, %lu segments",
+        (unsigned long)self.mutableWords.count, (unsigned long)self.mutableSegments.count];
+    if (self.panel) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.statusLabel.stringValue = message;
+        });
+    }
+
+    return @{
+        @"status": @"ok",
+        @"wordCount": @(self.mutableWords.count),
+        @"segmentCount": @(self.mutableSegments.count),
+        @"text": [self editableTranscriptText],
+    };
+}
+
+- (NSDictionary *)applyTranscriptEditorTextIfNeeded {
+    if (!self.panel || !self.transcriptTextView) return @{@"status": @"ok", @"applied": @NO};
+
+    __block NSString *editorText = nil;
+    void (^readBlock)(void) = ^{
+        editorText = self.transcriptTextView.string ?: @"";
+    };
+    if ([NSThread isMainThread]) readBlock();
+    else dispatch_sync(dispatch_get_main_queue(), readBlock);
+
+    NSString *trimmed = [editorText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0 || self.mutableWords.count == 0) {
+        return @{@"status": @"ok", @"applied": @NO};
+    }
+    if ([trimmed isEqualToString:[[self editableTranscriptText] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]]) {
+        return @{@"status": @"ok", @"applied": @NO};
+    }
+
+    NSMutableDictionary *result = [[self setTranscriptText:editorText] mutableCopy];
+    if (!result[@"error"]) result[@"applied"] = @YES;
+    return result;
+}
+
+- (void)applyTranscriptClicked:(id)sender {
+    NSDictionary *result = [self setTranscriptText:self.transcriptTextView.string ?: @""];
+    if (result[@"error"]) {
+        self.statusLabel.stringValue = [NSString stringWithFormat:@"Error: %@", result[@"error"]];
+    }
 }
 
 - (void)transcribeClicked:(id)sender { [self transcribeTimeline]; }
@@ -1870,6 +2205,8 @@ static void SpliceKit_installDragSpy(void) {
 
     self.status = SpliceKitCaptionStatusReady;
     [self regroupSegments];
+    [self persistCaptionDraftStateForCurrentSequence];
+    [self updateTranscriptEditorFromWords];
 
     dispatch_async(dispatch_get_main_queue(), ^{
         self.spinner.hidden = YES;
@@ -3089,6 +3426,8 @@ static NSData *SpliceKitWhisperServe_request(NSString *binaryPath, NSString *mod
     }
     self.status = SpliceKitCaptionStatusReady;
     [self regroupSegments];
+    [self persistCaptionDraftStateForCurrentSequence];
+    [self updateTranscriptEditorFromWords];
 }
 
 #pragma mark - Word Grouping
@@ -3519,24 +3858,13 @@ static BOOL SpliceKitCaption_usesWordHighlightRuntimeStyle(SpliceKitCaptionStyle
             [style.highlightColor isKindOfClass:[NSColor class]]);
 }
 
+static NSMutableDictionary<NSAttributedStringKey, id> *SpliceKitCaption_generatorTextAttributes(SpliceKitCaptionStyle *style,
+                                                                                                 NSColor *fillColor);
+
 static NSAttributedString *SpliceKitCaption_makeGeneratorAttributedString(NSString *text,
                                                                          SpliceKitCaptionStyle *style) {
     NSString *safeText = text ?: @"";
-    NSColor *textColor = style.textColor ?: [NSColor whiteColor];
-    NSString *fontName = style.font ?: @"Helvetica-Bold";
-    CGFloat fontSize = style.fontSize > 0 ? style.fontSize : 72.0;
-    NSFont *font = [NSFont fontWithName:fontName size:fontSize];
-    if (!font) font = [NSFont boldSystemFontOfSize:fontSize];
-
-    NSMutableParagraphStyle *paragraph = [[NSMutableParagraphStyle alloc] init];
-    paragraph.alignment = NSTextAlignmentCenter;
-    paragraph.lineBreakMode = NSLineBreakByWordWrapping;
-
-    NSDictionary *attrs = @{
-        NSFontAttributeName: font,
-        NSForegroundColorAttributeName: textColor,
-        NSParagraphStyleAttributeName: paragraph,
-    };
+    NSDictionary *attrs = SpliceKitCaption_generatorTextAttributes(style, style.textColor ?: [NSColor whiteColor]);
     return [[NSAttributedString alloc] initWithString:safeText attributes:attrs];
 }
 
@@ -3689,7 +4017,8 @@ static NSAttributedString *SpliceKitCaption_mergeAttributedTextWithTemplate(NSAt
 static BOOL SpliceKitCaption_setGeneratorAttributedTextWithOptions(id generator,
                                                                    NSAttributedString *attr,
                                                                    BOOL saveDirty,
-                                                                   BOOL allowChannelFallback) {
+                                                                   BOOL allowChannelFallback,
+                                                                   BOOL notifyChange) {
     if (!attr) return NO;
     SEL effectSel = NSSelectorFromString(@"effect");
     if (![generator respondsToSelector:effectSel]) return NO;
@@ -3777,8 +4106,10 @@ static BOOL SpliceKitCaption_setGeneratorAttributedTextWithOptions(id generator,
                 ((void (*)(id, SEL))objc_msgSend)(effect, saveSel);
                 SpliceKit_log(@"[Captions][RuntimeTitle] saveDirtyTextToEffectValues completed after attributed text update");
             }
-            SpliceKitCaption_notifyEffectChannelChanged(effect, nil, NO);
-            SpliceKitCaption_scheduleEffectTextRefreshPulses(effect, NO);
+            if (notifyChange) {
+                SpliceKitCaption_notifyEffectChannelChanged(effect, nil, NO);
+                SpliceKitCaption_scheduleEffectTextRefreshPulses(effect, NO);
+            }
             return YES;
         } @catch (NSException *e) {
             SpliceKit_log(@"[Captions][RuntimeTitle] setText:forField: failed on %@: %@",
@@ -3829,8 +4160,10 @@ static BOOL SpliceKitCaption_setGeneratorAttributedTextWithOptions(id generator,
                                   SpliceKitCaption_previewText([effectReadBack description], 120));
                 }
             }
-            SpliceKitCaption_notifyEffectChannelChanged(effect, textChannel, NO);
-            SpliceKitCaption_scheduleEffectTextRefreshPulses(effect, NO);
+            if (notifyChange) {
+                SpliceKitCaption_notifyEffectChannelChanged(effect, textChannel, NO);
+                SpliceKitCaption_scheduleEffectTextRefreshPulses(effect, NO);
+            }
             return YES;
         } @catch (NSException *e) {
             SpliceKit_log(@"[Captions][RuntimeTitle] CHChannelText setAttributedString failed on %@: %@",
@@ -3843,15 +4176,16 @@ static BOOL SpliceKitCaption_setGeneratorAttributedTextWithOptions(id generator,
 
 static BOOL SpliceKitCaption_setGeneratorAttributedText(id generator,
                                                         NSAttributedString *attr) {
-    return SpliceKitCaption_setGeneratorAttributedTextWithOptions(generator, attr, YES, YES);
+    return SpliceKitCaption_setGeneratorAttributedTextWithOptions(generator, attr, YES, YES, YES);
 }
 
 static BOOL SpliceKitCaption_setGeneratorAttributedTextForPersistedRepair(id generator,
                                                                           NSAttributedString *attr) {
     // Relaunch repair must commit the effect-level text field state or the viewer
     // can continue rendering the template placeholder even when read-back looks correct.
-    // Keep the low-level channel fallback disabled here to avoid the launch crash.
-    return SpliceKitCaption_setGeneratorAttributedTextWithOptions(generator, attr, YES, NO);
+    // Keep the low-level channel fallback and inspector refresh notifications disabled here
+    // to avoid crashing TextFramework style-preview rendering while FCP is still restoring.
+    return SpliceKitCaption_setGeneratorAttributedTextWithOptions(generator, attr, YES, NO, NO);
 }
 
 static void SpliceKitCaption_notifyEffectChannelChanged(id effect,
@@ -4301,7 +4635,9 @@ static BOOL SpliceKitCaption_saveChannelToEffectValues(id effect, id channel, BO
     return NO;
 }
 
-static BOOL SpliceKitCaption_applyGeneratorPositionYOffset(id titleObject, CGFloat yOffset) {
+static BOOL SpliceKitCaption_applyGeneratorPositionYOffset(id titleObject,
+                                                           CGFloat yOffset,
+                                                           BOOL notifyChange) {
     if (!titleObject) return NO;
 
     @try {
@@ -4349,8 +4685,10 @@ static BOOL SpliceKitCaption_applyGeneratorPositionYOffset(id titleObject, CGFlo
                             if ([effect respondsToSelector:finishedSel]) {
                                 ((void (*)(id, SEL))objc_msgSend)(effect, finishedSel);
                             }
-                            SpliceKitCaption_notifyEffectChannelChanged(effect, yChannel ?: xChannel, NO);
-                            SpliceKitCaption_scheduleEffectTextRefreshPulses(effect, NO);
+                            if (notifyChange) {
+                                SpliceKitCaption_notifyEffectChannelChanged(effect, yChannel ?: xChannel, NO);
+                                SpliceKitCaption_scheduleEffectTextRefreshPulses(effect, NO);
+                            }
                         }
                         return changed;
                     }
@@ -4666,7 +5004,7 @@ static BOOL SpliceKitCaption_pollMainThread(BOOL (^condition)(void), double time
                               SpliceKitCaption_describeObject(generator));
 
                 if (needsPosition) {
-                    BOOL preAppliedPosition = SpliceKitCaption_applyGeneratorPositionYOffset(generator, yOffset);
+                    BOOL preAppliedPosition = SpliceKitCaption_applyGeneratorPositionYOffset(generator, yOffset, YES);
                     segInfo[@"positionYOffset"] = @(yOffset);
                     segInfo[@"positionAppliedBeforeArchive"] = @(preAppliedPosition);
                     if (!preAppliedPosition) {
@@ -4937,7 +5275,7 @@ static BOOL SpliceKitCaption_pollMainThread(BOOL (^condition)(void), double time
 
                             // Set position via Motion template channel hierarchy
                             if (needsPosition) {
-                                if (SpliceKitCaption_applyGeneratorPositionYOffset(title, yOffset)) {
+                                if (SpliceKitCaption_applyGeneratorPositionYOffset(title, yOffset, YES)) {
                                     positionAppliedCount++;
                                 }
                             }
@@ -5078,6 +5416,10 @@ static BOOL SpliceKitCaption_pollMainThread(BOOL (^condition)(void), double time
     [xml appendFormat:@" font=\"%@\"", SpliceKitCaption_escapeXML(familyName)];
     [xml appendFormat:@" fontSize=\"%.0f\"", s.fontSize];
     [xml appendFormat:@" fontColor=\"%@\"", SpliceKitCaption_colorToFCPXML(color)];
+    if (s.outlineColor && s.outlineWidth > 0) {
+        [xml appendFormat:@" strokeColor=\"%@\" strokeWidth=\"%.2f\"",
+            SpliceKitCaption_colorToFCPXML(s.outlineColor), s.outlineWidth];
+    }
     [xml appendString:@" alignment=\"center\""];
     [xml appendString:@"/></text-style-def>"];
     return xml;
@@ -5616,6 +5958,8 @@ static BOOL SpliceKitCaption_pollMainThread(BOOL (^condition)(void), double time
 // Returns YES if condition became true before timeout, NO on timeout.
 - (NSDictionary *)generateCaptions {
     [self ensurePersistedStateLoaded];
+    NSDictionary *editorApplyResult = [self applyTranscriptEditorTextIfNeeded];
+    if (editorApplyResult[@"error"]) return editorApplyResult;
 
     SpliceKit_log(@"[Captions] generateCaptions called. Words: %lu, Segments: %lu",
                   (unsigned long)self.mutableWords.count, (unsigned long)self.mutableSegments.count);
@@ -5807,6 +6151,10 @@ static BOOL SpliceKitCaption_pollMainThread(BOOL (^condition)(void), double time
 // This matches the path FCP uses for File > Import > Captions (SRT/ITT).
 
 - (NSDictionary *)generateNativeCaptions:(NSString *)language format:(NSString *)format {
+    [self ensurePersistedStateLoaded];
+    NSDictionary *editorApplyResult = [self applyTranscriptEditorTextIfNeeded];
+    if (editorApplyResult[@"error"]) return editorApplyResult;
+
     SpliceKit_log(@"[NativeCaptions] generateNativeCaptions called. Words: %lu, Segments: %lu, lang=%@, fmt=%@",
                   (unsigned long)self.mutableWords.count, (unsigned long)self.mutableSegments.count,
                   language, format);
@@ -6044,6 +6392,8 @@ static BOOL SpliceKitCaption_pollMainThread(BOOL (^condition)(void), double time
 
 - (NSDictionary *)exportSRT:(NSString *)outputPath {
     [self ensurePersistedStateLoaded];
+    NSDictionary *editorApplyResult = [self applyTranscriptEditorTextIfNeeded];
+    if (editorApplyResult[@"error"]) return editorApplyResult;
 
     if (self.mutableSegments.count == 0) {
         return @{@"error": @"No segments to export — transcribe first"};
@@ -6073,6 +6423,8 @@ static BOOL SpliceKitCaption_pollMainThread(BOOL (^condition)(void), double time
 
 - (NSDictionary *)exportTXT:(NSString *)outputPath {
     [self ensurePersistedStateLoaded];
+    NSDictionary *editorApplyResult = [self applyTranscriptEditorTextIfNeeded];
+    if (editorApplyResult[@"error"]) return editorApplyResult;
 
     if (self.mutableSegments.count == 0) {
         return @{@"error": @"No segments to export — transcribe first"};
@@ -6164,6 +6516,7 @@ static BOOL SpliceKitCaption_pollMainThread(BOOL (^condition)(void), double time
         self.errorMessage = nil;
         if (transcript[@"frameRate"]) self.frameRate = [transcript[@"frameRate"] doubleValue];
         [self regroupSegments];
+        [self updateTranscriptEditorFromWords];
     }
 
     self.lastRestoredSequenceKey = sequenceKey;
@@ -6265,7 +6618,13 @@ static BOOL SpliceKitCaption_pollMainThread(BOOL (^condition)(void), double time
                 }
 
                 if (!didRestoreTextForTitle && text.length > 0) {
-                    if (SpliceKitCaption_setGeneratorTextFields(title, @[text], NO)) {
+                    NSAttributedString *styledText =
+                        SpliceKitCaption_makeGeneratorAttributedString(text, generatedStyle);
+                    if (SpliceKitCaption_setGeneratorAttributedTextForPersistedRepair(title, styledText)) {
+                        styledAppliedCount++;
+                        textRestoredCount++;
+                        didRestoreTextForTitle = YES;
+                    } else if (SpliceKitCaption_setGeneratorTextFields(title, @[text], NO)) {
                         textRestoredCount++;
                         plainFallbackCount++;
                         didRestoreTextForTitle = YES;
@@ -6276,7 +6635,7 @@ static BOOL SpliceKitCaption_pollMainThread(BOOL (^condition)(void), double time
             }
 
             if (needsPosition) {
-                if (SpliceKitCaption_applyGeneratorPositionYOffset(title, yOffset)) {
+                if (SpliceKitCaption_applyGeneratorPositionYOffset(title, yOffset, NO)) {
                     positionAppliedCount++;
                 }
             }
@@ -6347,6 +6706,7 @@ static BOOL SpliceKitCaption_pollMainThread(BOOL (^condition)(void), double time
     state[@"wordCount"] = @(self.mutableWords.count);
     state[@"segmentCount"] = @(self.mutableSegments.count);
     state[@"style"] = [self.style toDictionary];
+    state[@"transcriptText"] = [self editableTranscriptText];
 
     if (self.errorMessage) state[@"error"] = self.errorMessage;
     if (self.lastGenerateResult) state[@"lastGenerateResult"] = self.lastGenerateResult;

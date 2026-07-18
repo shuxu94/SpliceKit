@@ -514,6 +514,7 @@ CUSTOM_TOOL_TITLES = {
     "export_captions_srt": "Export Captions SRT",
     "export_captions_txt": "Export Captions Text",
     "set_caption_words": "Set Caption Words",
+    "set_caption_text": "Set Caption Text",
     "generate_native_captions": "Generate Native Captions",
     "verify_native_captions": "Verify Native Captions",
     "mark_scene_changes": "Mark Scene Changes",
@@ -6756,7 +6757,8 @@ def set_caption_style(preset_id: str = "", font: str = "", font_size: float = 0,
                       text_color: str = "", highlight_color: str = "",
                       outline_color: str = "", outline_width: float = -1,
                       position: str = "", animation: str = "",
-                      word_highlight: bool = True, all_caps: bool = False) -> str:
+                      position_y: float = 0, word_highlight: bool = True,
+                      all_caps: bool = False) -> str:
     """Set the caption style, either from a preset or with custom values.
 
     Args:
@@ -6768,7 +6770,10 @@ def set_caption_style(preset_id: str = "", font: str = "", font_size: float = 0,
         highlight_color: RGBA for active word highlight
         outline_color: RGBA for text outline/stroke
         outline_width: Stroke width (0-6)
-        position: "bottom", "center", "top"
+        position: "bottom", "center", "top", or "custom"
+        position_y: Exact vertical offset for custom positioning. Positive moves up,
+                    negative moves down. Use with position="custom", or pass any
+                    non-zero value to switch to custom automatically.
         animation: "none", "fade", "pop", "slide_up", "typewriter", "bounce"
         word_highlight: Enable word-by-word karaoke highlighting (default True)
         all_caps: Convert text to uppercase
@@ -6792,6 +6797,9 @@ def set_caption_style(preset_id: str = "", font: str = "", font_size: float = 0,
         params["outlineWidth"] = outline_width
     if position:
         params["position"] = position
+    if position_y != 0 or position == "custom":
+        params["position"] = "custom"
+        params["customYOffset"] = position_y
     if animation:
         params["animation"] = animation
     params["wordByWordHighlight"] = word_highlight
@@ -6827,7 +6835,8 @@ def set_caption_grouping(mode: str = "social", max_words: int = 3,
 @mcp.tool(annotations=_tool_annotations("generate_captions"))
 def generate_captions(style: str = "", position: str = "center",
                       animation: str = "pop", word_highlight: bool = True,
-                      max_words: int = 3, all_caps: bool = True) -> str:
+                      max_words: int = 3, all_caps: bool = True,
+                      position_y: float = 0) -> str:
     """Generate social-media-style captions and add them to the USER's timeline.
 
     One-shot tool: uses the current transcription (or existing words),
@@ -6835,7 +6844,7 @@ def generate_captions(style: str = "", position: str = "center",
     temp project, then copies and pastes them as a connected storyline
     onto the user's actual timeline. The temp project is deleted after.
 
-    Position offset (bottom/center/top) is applied via ObjC transform
+    Position offset (bottom/center/top/custom Y) is applied via ObjC transform
     after paste, not via FCPXML adjust-transform (which breaks with
     Motion templates).
 
@@ -6847,7 +6856,10 @@ def generate_captions(style: str = "", position: str = "center",
 
     Args:
         style: Preset ID (e.g. "bold_pop", "social_bold"). Empty = current style.
-        position: "bottom", "center", "top"
+        position: "bottom", "center", "top", or "custom"
+        position_y: Exact vertical offset for custom positioning. Positive moves up,
+                    negative moves down. Use with position="custom", or pass any
+                    non-zero value to switch to custom automatically.
         animation: "none", "fade", "pop", "slide_up", "typewriter", "bounce"
         word_highlight: Word-by-word karaoke highlighting (default True)
         max_words: Max words per caption segment (default 3)
@@ -6860,6 +6872,9 @@ def generate_captions(style: str = "", position: str = "center",
     if style:
         params["style"] = style
     params["position"] = position
+    if position_y != 0 or position == "custom":
+        params["position"] = "custom"
+        params["customYOffset"] = position_y
     params["animation"] = animation
     params["wordByWordHighlight"] = word_highlight
     params["maxWords"] = max_words
@@ -6922,6 +6937,26 @@ def set_caption_words(words: str) -> str:
         return f"Invalid JSON: {e}"
 
     r = bridge.call("captions.setWords", words=word_list)
+    if _err(r):
+        return f"Error: {r.get('error', r)}"
+    return _fmt(r)
+
+
+@mcp.tool(annotations=_tool_annotations("set_caption_text"))
+def set_caption_text(text: str) -> str:
+    """Correct the current caption transcript text while preserving timings.
+
+    Use after open_captions() has finished transcribing. Fetch the current text
+    with get_caption_state() (the response includes transcriptText), edit it,
+    then call this before generate_captions().
+
+    Args:
+        text: Corrected transcript as plain text. Words are split on whitespace.
+              If the word count stays the same, each word keeps its exact timing.
+              If words are added or removed, timings are redistributed across
+              the original transcript span.
+    """
+    r = bridge.call("captions.setTranscriptText", text=text)
     if _err(r):
         return f"Error: {r.get('error', r)}"
     return _fmt(r)

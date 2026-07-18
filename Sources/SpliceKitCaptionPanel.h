@@ -131,6 +131,8 @@ extern NSNotificationName const SpliceKitCaptionDidGenerateNotification;
 // Transcription (delegates to SpliceKitTranscriptPanel)
 - (void)transcribeTimeline;
 - (void)setWordsManually:(NSArray<NSDictionary *> *)wordDicts;
+- (NSDictionary *)setTranscriptText:(NSString *)text;
+- (NSString *)editableTranscriptText;
 
 // Style
 - (void)setStyle:(SpliceKitCaptionStyle *)style;
