@@ -32,6 +32,10 @@
 @property (nonatomic) double endTime;          // silence end (start of next word)
 @property (nonatomic) double duration;         // endTime - startTime
 @property (nonatomic) NSUInteger afterWordIndex;  // index of word before this silence (-1 if before first word)
+@property (nonatomic) BOOL inferred;           // estimated from long/contiguous word timing
+@property (nonatomic) BOOL audioDetected;      // measured from timeline audio with FFmpeg
+@property (nonatomic) double confidence;       // detector stability, 0.0 - 1.0
+@property (nonatomic) BOOL selectedForRemoval; // only confirmed candidates are selected by default
 @property (nonatomic) NSRange textRange;       // range in text view string
 @end
 
@@ -87,11 +91,15 @@ typedef NS_ENUM(NSInteger, SpliceKitTranscriptEngine) {
 @property (nonatomic, copy) NSString *parakeetModelVersion; // @"v3" (multilingual) or @"v2" (English)
 
 // Silence operations
-@property (nonatomic) double silenceThreshold;  // seconds, default 0.3
+@property (nonatomic) double silenceThreshold;  // minimum cut: one frame; detected voice keeps protected edge handles
 - (void)detectSilences;                          // recompute silences from word timings
 - (void)redetectSilencesAndRefreshUI;            // detectSilences + rebuild text view
+- (void)detectAudioSilencesWithCompletion:(void (^)(NSDictionary *result))completion;
 - (NSDictionary *)deleteAllSilences;
 - (NSDictionary *)deleteSilencesLongerThan:(double)minDuration;
+- (NSDictionary *)deleteSilencesLongerThan:(double)minDuration
+                           boundaryPadding:(double)boundaryPadding
+                           includeInferred:(BOOL)includeInferred;
 
 // Speaker assignment
 - (void)setSpeaker:(NSString *)speaker forWordsFrom:(NSUInteger)startIndex count:(NSUInteger)count;

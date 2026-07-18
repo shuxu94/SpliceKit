@@ -222,6 +222,7 @@ READ_ONLY_TOOLS = {
     "explore_class",
     "search_methods",
     "get_transcript",
+    "detect_audio_silences",
     "search_transcript",
     "list_effects",
     "list_transitions",
@@ -434,6 +435,7 @@ CUSTOM_TOOL_TITLES = {
     "visionpro_send_mask": "Send Vision Pro Camera Mask",
     "visionpro_set_max_clients": "Set Vision Pro Max Clients",
     "delete_transcript_silences": "Delete Transcript Silences",
+    "detect_audio_silences": "Detect Timeline Audio Silences",
     "set_silence_threshold": "Set Silence Threshold",
     "show_command_palette": "Show Command Palette",
     "hide_command_palette": "Hide Command Palette",
@@ -2825,28 +2827,59 @@ def search_transcript(query: str) -> str:
 
 
 @mcp.tool(annotations=_tool_annotations("delete_transcript_silences"))
-def delete_transcript_silences(min_duration: float = 0.0) -> str:
-    """Delete all detected silences/pauses from the timeline.
+def delete_transcript_silences(
+    min_duration: float = 0.0,
+    boundary_padding: float = 0.175,
+    include_inferred: bool = False,
+) -> str:
+    """Delete high-confidence FFmpeg-confirmed silences from the timeline.
 
     This performs batch ripple-deletes on all silence gaps, removing dead air
     from the video. Silences are deleted from end to start to maintain accuracy.
 
     Args:
-        min_duration: Minimum silence duration in seconds to delete. Default 0 = all silences.
-                      Use 0.5 to only delete pauses longer than half a second, etc.
+        min_duration: Minimum silence duration in seconds to delete. Default 0 = all safe silences.
+                      Use 0.8 to only delete pauses at least eight-tenths of a second long.
+        boundary_padding: Room-tone handle preserved on each side of a deleted pause.
+                          Default 0.175 seconds (0.35 seconds total).
+        include_inferred: Compatibility option. Transcript-inferred pauses are never
+                          removed unless first confirmed by FFmpeg audio analysis.
 
     Use timeline_action("undo") repeatedly to reverse.
     """
-    r = bridge.call("transcript.deleteSilences", minDuration=min_duration)
+    r = bridge.call(
+        "transcript.deleteSilences",
+        minDuration=min_duration,
+        boundaryPadding=boundary_padding,
+        includeInferred=include_inferred,
+    )
     if _err(r):
         return f"Error: {r.get('error', r)}"
 
     lines = [f"Status: {r.get('status', 'unknown')}"]
     lines.append(f"Deleted: {r.get('deletedCount', 0)}/{r.get('totalSilences', 0)} silences")
+    lines.append(f"Boundary padding: {r.get('boundaryPadding', boundary_padding):.2f}s per side")
+    if r.get("skippedInferred", 0):
+        lines.append(f"Skipped inferred pauses: {r['skippedInferred']}")
     if r.get("lastError"):
         lines.append(f"Last error: {r['lastError']}")
 
     return "\n".join(lines)
+
+
+@mcp.tool(annotations=_tool_annotations("detect_audio_silences"))
+def detect_audio_silences() -> str:
+    """Analyze the current FCP timeline audio for silence using FFmpeg.
+
+    This does not use Parakeet or any transcription service. Detection uses a
+    conservative threshold followed by a second threshold for boundary
+    stability. High-confidence ranges are selected for removal; uncertain
+    ranges remain review-only. Use get_transcript() to inspect the results.
+    """
+    r = bridge.call("transcript.detectAudioSilences")
+    if _err(r):
+        return f"Error: {r.get('error', r)}"
+    return r.get("message", "FFmpeg audio silence detection started.")
 
 
 @mcp.tool(annotations=_tool_annotations("set_transcript_speaker"))

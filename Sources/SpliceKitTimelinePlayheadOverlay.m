@@ -74,6 +74,7 @@ static CADisplayLink *sDisplayLink = nil;
 // need to remember which scrollingTimeline we paused and its prior state
 // so we can restore on playback end.
 static __weak id sPausedScrollingTimelineWeak = nil;
+static __weak NSView *sPausedTimelineViewWeak = nil;
 static BOOL      sScrollingTimelineWasPaused = NO;
 
 // Last observed playhead state from the swizzle.
@@ -130,15 +131,12 @@ static NSView *PO_currentTimelineView(void) {
 // Try a few ivar names Apple has used for the playhead layer on TLKTimelineView.
 static CALayer *PO_findRealPlayheadLayer(NSView *timelineView) {
     if (!timelineView) return nil;
-    CALayer *cached = sRealPlayheadLayerWeak;
-    if (cached && cached.superlayer) return cached;
     NSArray *keys = @[@"playheadMarker", @"_playheadMarker", @"playhead",
                       @"_playhead", @"playheadLayer", @"_playheadLayer"];
     for (NSString *key in keys) {
         @try {
             id v = [timelineView valueForKey:key];
             if ([v isKindOfClass:[CALayer class]]) {
-                sRealPlayheadLayerWeak = v;
                 return v;
             }
         } @catch (NSException *e) {
@@ -243,6 +241,75 @@ static void PO_updateOverlayPath(NSView *timelineView) {
     sOverlayLayer.bounds = CGRectMake(-1.0, 0.0, 2.0, h);
 }
 
+// Restore the native playhead that the overlay currently owns.  Keeping this
+// in one helper is important because FCP can replace TLKTimelineView while
+// playback is still running (project switches, workspace changes, dual
+// timeline focus changes).  In that case the old native layer must not remain
+// hidden after our cosmetic layer moves to the new view.
+static void PO_restoreRealPlayhead(void) {
+    CALayer *real = sRealPlayheadLayerWeak;
+    if (real) real.hidden = sRealPlayheadWasHidden;
+    sRealPlayheadLayerWeak = nil;
+    sRealPlayheadWasHidden = NO;
+}
+
+// Stop presenting the cosmetic playhead and immediately fall back to FCP's
+// native one.  Every failure path in the display-link tick uses this so a
+// missing/stale observation can never leave both playheads invisible.
+static void PO_deactivateOverlayVisual(void) {
+    if (sOverlayLayer) sOverlayLayer.hidden = YES;
+    PO_restoreRealPlayhead();
+}
+
+static void PO_restorePausedScrollingTimeline(void) {
+    id paused = sPausedScrollingTimelineWeak;
+    if (paused) {
+        @try {
+            SEL pausedSet = NSSelectorFromString(@"setPaused:");
+            if ([paused respondsToSelector:pausedSet]) {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(paused, pausedSet,
+                                                        sScrollingTimelineWasPaused);
+            }
+        } @catch (...) {}
+    }
+    sPausedScrollingTimelineWeak = nil;
+    sPausedTimelineViewWeak = nil;
+    sScrollingTimelineWasPaused = NO;
+}
+
+// Transfer visual ownership to timelineView only after the overlay has a
+// valid position.  This also reattaches the layer when FCP swaps timeline
+// views mid-playback, which was the main cause of the yellow line vanishing.
+static BOOL PO_activateOverlayVisual(NSView *timelineView) {
+    if (!timelineView) return NO;
+    if (sPausedScrollingTimelineWeak && timelineView != sPausedTimelineViewWeak) {
+        // The paused scroller belongs to the timeline that just went away.
+        // Restore it; the replacement view keeps its native scroll behavior.
+        PO_restorePausedScrollingTimeline();
+    }
+    PO_attachOverlayLayerIfNeeded(timelineView);
+    if (!sOverlayLayer || sOverlayLayer.superlayer != timelineView.layer) {
+        PO_deactivateOverlayVisual();
+        return NO;
+    }
+
+    CALayer *real = PO_findRealPlayheadLayer(timelineView);
+    if (real != sRealPlayheadLayerWeak) {
+        PO_restoreRealPlayhead();
+        sRealPlayheadLayerWeak = real;
+        if (real) {
+            sRealPlayheadWasHidden = real.hidden;
+            real.hidden = YES;
+        }
+    } else if (real) {
+        // TimelineKit can unhide its layer during an internal reload.
+        real.hidden = YES;
+    }
+
+    sOverlayLayer.hidden = NO;
+    return YES;
+}
+
 // ---- Display link tick ----
 
 @interface SpliceKitPlayheadOverlayTarget : NSObject
@@ -274,7 +341,10 @@ static BOOL PO_scrollDuringPlayback(id timelineView) {
 @implementation SpliceKitPlayheadOverlayTarget
 - (void)tick:(CADisplayLink *)link {
     NSView *view = PO_currentTimelineView();
-    if (!view || !sOverlayLayer) return;
+    if (!view || !sOverlayLayer) {
+        PO_deactivateOverlayVisual();
+        return;
+    }
 
     os_unfair_lock_lock(&sObservedLock);
     PO_CMTime base = sObservedTime;
@@ -283,20 +353,29 @@ static BOOL PO_scrollDuringPlayback(id timelineView) {
     os_unfair_lock_unlock(&sObservedLock);
 
     // If nothing has been observed yet, we have no reference — skip this tick.
-    if (base.timescale <= 0 || baseWall <= 0.0) return;
+    if (base.timescale <= 0 || baseWall <= 0.0) {
+        PO_deactivateOverlayVisual();
+        return;
+    }
 
     // Skip when paused: tick only needs to extrapolate during active playback,
     // and if we've gone idle the cached view may be mid-teardown. APPLE-MACOS-P
     // shows EXC_BAD_ACCESS deep inside locationRangeForTime: when this fires
     // against a view whose internals were freed.
-    if (rate == 0.0) return;
+    if (rate == 0.0) {
+        PO_deactivateOverlayVisual();
+        return;
+    }
 
     // Stale observation: if we haven't seen a setPlayheadTime in a while, the
     // cached view may have been replaced (sequence change, dual-timeline
     // toggle). Bail out and wait for a fresh observation rather than calling
     // into a possibly-dead view.
     CFTimeInterval elapsed = CACurrentMediaTime() - baseWall;
-    if (elapsed > 5.0) return;
+    if (elapsed > 5.0) {
+        PO_deactivateOverlayVisual();
+        return;
+    }
 
     // Extrapolate forward: t_now = base + (now - baseWall) * rate
     double extraSecs = elapsed * rate;
@@ -305,7 +384,16 @@ static BOOL PO_scrollDuringPlayback(id timelineView) {
     extrapolated.value += addValue;
 
     double x = 0.0;
-    if (!PO_xForTime(view, extrapolated, &x)) return;
+    if (!PO_xForTime(view, extrapolated, &x) || !isfinite(x)) {
+        PO_deactivateOverlayVisual();
+        return;
+    }
+
+    // Set the new position before hiding the native playhead.  If FCP has
+    // replaced the timeline view, activation reparents our layer atomically
+    // from the user's perspective instead of leaving a blank interval.
+    sOverlayLayer.position = CGPointMake(x, 0.0);
+    if (!PO_activateOverlayVisual(view)) return;
 
     CGFloat h = view.bounds.size.height;
     if (sOverlayLayer.bounds.size.height != h) {
@@ -324,7 +412,8 @@ static BOOL PO_scrollDuringPlayback(id timelineView) {
         vrect = [view visibleRect];
     } @catch (...) {}
 
-    BOOL drivingScroll = (sPausedScrollingTimelineWeak != nil);
+    BOOL drivingScroll = (sPausedScrollingTimelineWeak != nil &&
+                          view == sPausedTimelineViewWeak);
     CGFloat overlayX = x;  // content-space x for the overlay line
 
     if (drivingScroll && vrect.size.width > 0.0) {
@@ -417,6 +506,10 @@ static void PO_stopDisplayLink(void) {
 
 static void PO_onPlaybackBegan(void) {
     sIsPlaying = YES;
+    // A missed end notification from a previous playback must not carry
+    // hidden-layer ownership into the new session.
+    PO_deactivateOverlayVisual();
+    PO_restorePausedScrollingTimeline();
     NSView *view = PO_currentTimelineView();
     if (!view) return;
     PO_attachOverlayLayerIfNeeded(view);
@@ -463,13 +556,6 @@ static void PO_onPlaybackBegan(void) {
         }
     }
 
-    // Hide Apple's playhead so the user sees one smooth line.
-    CALayer *real = PO_findRealPlayheadLayer(view);
-    if (real) {
-        sRealPlayheadWasHidden = real.hidden;
-        real.hidden = YES;
-    }
-
     // Pause Apple's auto-scroll *only* when the user has centered-during-
     // playback on AND our safety probe succeeded. TLKScrollingTimeline
     // otherwise runs step-based `scrollPlayheadTowardMiddle` on every
@@ -479,8 +565,6 @@ static void PO_onPlaybackBegan(void) {
     // intact — the user explicitly chose "playhead slides off to the right
     // until it reaches the edge," and our 120Hz overlay already gives them
     // a smooth line.
-    sPausedScrollingTimelineWeak = nil;
-    sScrollingTimelineWasPaused = NO;
     if (userWantsCentered && canDriveScroll) {
         @try {
             SEL stSel = NSSelectorFromString(@"scrollingTimeline");
@@ -496,13 +580,16 @@ static void PO_onPlaybackBegan(void) {
                 if ([scrollingTimeline respondsToSelector:pausedSet]) {
                     ((void (*)(id, SEL, BOOL))objc_msgSend)(scrollingTimeline, pausedSet, YES);
                     sPausedScrollingTimelineWeak = scrollingTimeline;
+                    sPausedTimelineViewWeak = view;
                     SpliceKit_log(@"[PlayheadOverlay] Paused TLKScrollingTimeline (centered-playback mode)");
                 }
             }
         } @catch (...) {}
     }
 
-    sOverlayLayer.hidden = NO;
+    // Keep the native playhead visible until the first display-link tick has
+    // both a valid time-to-x mapping and an attached replacement layer.
+    sOverlayLayer.hidden = YES;
     PO_startDisplayLink(view);
 }
 
@@ -510,24 +597,9 @@ static void PO_onPlaybackEnded(void) {
     sIsPlaying = NO;
     PO_stopDisplayLink();
 
-    CALayer *real = sRealPlayheadLayerWeak;
-    if (real) real.hidden = sRealPlayheadWasHidden;
+    PO_deactivateOverlayVisual();
 
-    // Restore Apple's scrollingTimeline pause state if we changed it.
-    id paused = sPausedScrollingTimelineWeak;
-    if (paused) {
-        @try {
-            SEL pausedSet = NSSelectorFromString(@"setPaused:");
-            if ([paused respondsToSelector:pausedSet]) {
-                ((void (*)(id, SEL, BOOL))objc_msgSend)(paused, pausedSet,
-                                                        sScrollingTimelineWasPaused);
-            }
-        } @catch (...) {}
-    }
-    sPausedScrollingTimelineWeak = nil;
-    sScrollingTimelineWasPaused = NO;
-
-    sOverlayLayer.hidden = YES;
+    PO_restorePausedScrollingTimeline();
 }
 
 // ---- Install / remove ----
@@ -579,9 +651,9 @@ void SpliceKit_removeTimelinePlayheadOverlay(void) {
     if (!sOverlayInstalled) return;
     PO_stopDisplayLink();
 
-    // Restore real playhead if we hid it
-    CALayer *real = sRealPlayheadLayerWeak;
-    if (real) real.hidden = sRealPlayheadWasHidden;
+    // Restore real playhead if we hid it.
+    PO_deactivateOverlayVisual();
+    PO_restorePausedScrollingTimeline();
 
     if (sOverlayLayer) {
         [sOverlayLayer removeFromSuperlayer];

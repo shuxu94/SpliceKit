@@ -24,6 +24,8 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
+extern NSDictionary *SpliceKit_handleFCPXMLExport(NSDictionary *params);
+
 // x86_64 ABI requires objc_msgSend_stret for struct returns > 16 bytes.
 // ARM64 returns all structs through objc_msgSend (no _stret variant exists).
 #if defined(__x86_64__)
@@ -37,6 +39,131 @@
 // on macOS, but still), we just fall back to other engines.
 static Class SFSpeechRecognizerClass = nil;
 static Class SFSpeechURLRecognitionRequestClass = nil;
+
+// Conservative defaults for destructive text-based editing.  ASR word
+// boundaries are estimates, so bulk deletion must leave a small handle around
+// speech and should not treat normal conversational pauses as dead air.
+static const double kSpliceKitDefaultSilenceThreshold = 0.8;
+static const double kSpliceKitDefaultSilenceBoundaryPadding = 0.175;
+static const double kSpliceKitDefaultSilenceNoiseDB = -50.0;
+static const double kSpliceKitDefaultSilenceConfirmDB = -45.0;
+static const double kSpliceKitDefaultSilenceMergeGap = 0.15;
+// A destructive speech edit must optimize for recall at phoneme boundaries.
+// Silero and energy gates both tend to open late and close early, especially
+// around quiet consonants. Protect at least 100 ms and at least three video
+// frames on each side of every agreed voice region before deriving cuts.
+static const double kSpliceKitMinimumVoiceEdgeProtectionSeconds = 0.100;
+static const double kSpliceKitMinimumVoiceEdgeProtectionFrames = 3.0;
+
+static double SpliceKitTranscript_secondsFromFCPXMLTime(NSString *value) {
+    if (![value isKindOfClass:[NSString class]] || value.length == 0) return 0.0;
+    NSString *raw = [value hasSuffix:@"s"] ? [value substringToIndex:value.length - 1] : value;
+    NSArray<NSString *> *parts = [raw componentsSeparatedByString:@"/"];
+    if (parts.count == 2) {
+        double denominator = [parts[1] doubleValue];
+        return denominator != 0.0 ? [parts[0] doubleValue] / denominator : 0.0;
+    }
+    return raw.doubleValue;
+}
+
+// In synchronized clips FCP does not necessarily put enabled="0" on the
+// camera asset-clip. Instead it can disable the top/storyline audio through a
+// sibling sync-source declaration. Treat a source as inactive only when FCP
+// explicitly lists role state and every listed role is disabled or inactive. If
+// any role is enabled and active (or has no explicit state), keep the source so we never
+// remove speech from a partially enabled multirole source.
+static BOOL SpliceKitTranscript_syncSourceAudioIsExplicitlyInactive(
+    NSXMLElement *syncClip, NSString *requestedSourceID) {
+    BOOL foundRoleState = NO;
+    BOOL foundEnabledActiveRole = NO;
+    for (NSXMLElement *syncSource in [syncClip elementsForName:@"sync-source"]) {
+        NSString *sourceID = [[syncSource attributeForName:@"sourceID"] stringValue];
+        if (![sourceID isEqualToString:requestedSourceID]) continue;
+        for (NSXMLElement *roleSource in [syncSource elementsForName:@"audio-role-source"]) {
+            foundRoleState = YES;
+            NSString *active = [[roleSource attributeForName:@"active"] stringValue];
+            NSString *enabled = [[roleSource attributeForName:@"enabled"] stringValue];
+            // Both attributes default to 1 in the FCPXML DTD. Missing state is
+            // therefore enabled/active; either explicit zero disables the role.
+            if (![active isEqualToString:@"0"] && ![enabled isEqualToString:@"0"]) {
+                foundEnabledActiveRole = YES;
+            }
+        }
+    }
+    return foundRoleState && !foundEnabledActiveRole;
+}
+
+static NSArray<NSDictionary *> *SpliceKitTranscript_mergeTimeRanges(
+    NSArray<NSDictionary *> *ranges, double gap) {
+    NSArray *sorted = [ranges sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [a[@"start"] compare:b[@"start"]];
+    }];
+    NSMutableArray<NSMutableDictionary *> *merged = [NSMutableArray array];
+    for (NSDictionary *range in sorted) {
+        double start = [range[@"start"] doubleValue];
+        double end = [range[@"end"] doubleValue];
+        if (end <= start) continue;
+        NSMutableDictionary *previous = merged.lastObject;
+        if (previous && start <= [previous[@"end"] doubleValue] + gap) {
+            previous[@"end"] = @(MAX(end, [previous[@"end"] doubleValue]));
+        } else {
+            [merged addObject:[@{@"start": @(start), @"end": @(end)} mutableCopy]];
+        }
+    }
+    return merged;
+}
+
+static NSArray<NSDictionary *> *SpliceKitTranscript_intersectTimeRanges(
+    NSArray<NSDictionary *> *left, NSArray<NSDictionary *> *right) {
+    NSArray *a = SpliceKitTranscript_mergeTimeRanges(left, 0.0);
+    NSArray *b = SpliceKitTranscript_mergeTimeRanges(right, 0.0);
+    NSMutableArray *result = [NSMutableArray array];
+    NSUInteger i = 0, j = 0;
+    while (i < a.count && j < b.count) {
+        double start = MAX([a[i][@"start"] doubleValue], [b[j][@"start"] doubleValue]);
+        double end = MIN([a[i][@"end"] doubleValue], [b[j][@"end"] doubleValue]);
+        if (end > start) [result addObject:@{@"start": @(start), @"end": @(end)}];
+        if ([a[i][@"end"] doubleValue] <= [b[j][@"end"] doubleValue]) i++;
+        else j++;
+    }
+    return result;
+}
+
+static NSArray<NSDictionary *> *SpliceKitTranscript_complementTimeRanges(
+    NSArray<NSDictionary *> *ranges, double start, double end) {
+    NSMutableArray *result = [NSMutableArray array];
+    double cursor = start;
+    for (NSDictionary *range in SpliceKitTranscript_mergeTimeRanges(ranges, 0.0)) {
+        double rangeStart = MAX(start, [range[@"start"] doubleValue]);
+        double rangeEnd = MIN(end, [range[@"end"] doubleValue]);
+        if (rangeEnd <= rangeStart) continue;
+        if (rangeStart > cursor) {
+            [result addObject:@{@"start": @(cursor), @"end": @(rangeStart)}];
+        }
+        cursor = MAX(cursor, rangeEnd);
+    }
+    if (cursor < end) [result addObject:@{@"start": @(cursor), @"end": @(end)}];
+    return result;
+}
+
+static NSString *SpliceKitTranscript_audioPlanFingerprint(NSArray<NSDictionary *> *clipInfos) {
+    NSMutableArray<NSString *> *parts = [NSMutableArray arrayWithCapacity:clipInfos.count];
+    for (NSDictionary *clipInfo in clipInfos) {
+        NSURL *url = clipInfo[@"mediaURL"];
+        [parts addObject:[NSString stringWithFormat:@"%@|%@|%@|%.12f|%.12f|%.12f|%.12f|%.12f|%.12f",
+            clipInfo[@"sequenceUID"] ?: @"",
+            clipInfo[@"sequenceName"] ?: @"",
+            url.path ?: @"",
+            [clipInfo[@"timelineStart"] doubleValue],
+            [clipInfo[@"duration"] doubleValue],
+            [clipInfo[@"audioFileStart"] doubleValue],
+            [clipInfo[@"timelineItemStart"] doubleValue],
+            [clipInfo[@"timelineItemDuration"] doubleValue],
+            [clipInfo[@"sequenceDuration"] doubleValue]]];
+    }
+    [parts sortUsingSelector:@selector(compare:)];
+    return [parts componentsJoinedByString:@"\n"];
+}
 
 static void SpliceKitTranscript_loadSpeechFramework(void) {
     static dispatch_once_t onceToken;
@@ -105,8 +232,10 @@ static NSString *SpliceKitTranscript_timecodeFromSeconds(double seconds, double 
 @implementation SpliceKitTranscriptSilence
 
 - (NSString *)description {
-    return [NSString stringWithFormat:@"Silence: %.2f-%.2f (%.2fs) after word %lu",
-            _startTime, _endTime, _duration, (unsigned long)_afterWordIndex];
+    return [NSString stringWithFormat:@"Silence: %.2f-%.2f (%.2fs) after word %lu%@%@",
+            _startTime, _endTime, _duration, (unsigned long)_afterWordIndex,
+            _inferred ? @" [inferred]" : @"",
+            _audioDetected ? [NSString stringWithFormat:@" [audio %.0f%%]", _confidence * 100.0] : @""];
 }
 
 @end
@@ -159,6 +288,10 @@ static NSDictionary *SpliceKitTranscript_silenceToDictionary(SpliceKitTranscript
         @"endTime": @(silence.endTime),
         @"duration": @(silence.duration),
         @"afterWordIndex": @(silence.afterWordIndex),
+        @"inferred": @(silence.inferred),
+        @"audioDetected": @(silence.audioDetected),
+        @"confidence": @(silence.confidence),
+        @"selectedForRemoval": @(silence.selectedForRemoval),
     };
 }
 
@@ -169,6 +302,11 @@ static SpliceKitTranscriptSilence *SpliceKitTranscript_silenceFromDictionary(NSD
     silence.endTime = [dict[@"endTime"] doubleValue];
     silence.duration = [dict[@"duration"] doubleValue];
     silence.afterWordIndex = [dict[@"afterWordIndex"] unsignedIntegerValue];
+    silence.inferred = [dict[@"inferred"] boolValue];
+    silence.audioDetected = [dict[@"audioDetected"] boolValue];
+    silence.confidence = [dict[@"confidence"] doubleValue];
+    silence.selectedForRemoval = dict[@"selectedForRemoval"]
+        ? [dict[@"selectedForRemoval"] boolValue] : !silence.inferred;
     return silence;
 }
 
@@ -435,7 +573,9 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
 @property (nonatomic, strong) NSSearchField *searchField;
 @property (nonatomic, strong) NSPopUpButton *filterPopup;
 @property (nonatomic, strong) NSButton *deleteResultsButton;
+@property (nonatomic, strong) NSButton *detectSilencesButton;
 @property (nonatomic, strong) NSButton *deleteSilencesButton;
+@property (nonatomic, strong) NSPopUpButton *silencePresetPopup;
 @property (nonatomic, strong) NSTextField *resultCountLabel;
 @property (nonatomic, strong) NSButton *prevResultButton;
 @property (nonatomic, strong) NSButton *nextResultButton;
@@ -477,6 +617,23 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
 @property (nonatomic) double frameRate;
 @property (nonatomic) BOOL suppressPersistenceWrites;
 @property (nonatomic, copy) NSString *lastRestoredSequenceKey;
+@property (nonatomic) double audioSilenceNoiseDB;
+@property (nonatomic) double audioSilenceConfirmDB;
+@property (nonatomic) double audioSilenceMergeGap;
+@property (nonatomic) double audioSilenceRoomTone;
+@property (nonatomic) double audioVoiceVADThreshold;
+@property (nonatomic) double audioVoicePadding;
+@property (nonatomic) double audioVoiceMinimumEvidence;
+@property (nonatomic) BOOL audioSilenceDetectionRunning;
+// A detected mask is valid only for the exact sequence and duration that
+// produced it.  Without this guard, switching projects while FFmpeg/VAD is
+// running can leave destructive ranges from the old timeline in the panel.
+@property (nonatomic, weak) id audioSilenceDetectionSequence;
+@property (nonatomic, copy) NSString *audioSilenceDetectionTimelineFingerprint;
+- (NSString *)audioSilencePlanValidationError;
+- (double)durationSecondsForSequence:(id)sequence;
+- (void)scheduleRetranscribe;
+- (void)scheduleAudioSilenceRedetection;
 @end
 
 @implementation SpliceKitTranscriptPanel
@@ -502,7 +659,18 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
         _searchResultRanges = [NSMutableArray array];
         _currentSearchIndex = -1;
         _currentFilter = @"all";
-        _silenceThreshold = 0.3; // 300ms default
+        // The default matches the verified "keep clear voice" ground-truth
+        // pass: energy alone is insufficient, and VAD alone produces false
+        // positives on room tone. Their temporal agreement anchors voice, then
+        // protected edge handles preserve low-energy phoneme boundaries.
+        _silenceThreshold = 1.0 / 30.0;
+        _audioSilenceNoiseDB = -35.0;
+        _audioSilenceConfirmDB = -35.0;
+        _audioSilenceMergeGap = kSpliceKitDefaultSilenceMergeGap;
+        _audioSilenceRoomTone = 0.0;
+        _audioVoiceVADThreshold = 0.25;
+        _audioVoicePadding = kSpliceKitMinimumVoiceEdgeProtectionSeconds;
+        _audioVoiceMinimumEvidence = 0.05;
         _frameRate = 24.0;
         _engine = SpliceKitTranscriptEngineParakeet; // Default to Parakeet (fastest, most accurate)
         _parakeetModelVersion = @"v3"; // v3 = multilingual, v2 = English-optimized
@@ -539,7 +707,7 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     self.panel.becomesKeyOnlyIfNeeded = NO;
     self.panel.hidesOnDeactivate = NO;
     self.panel.level = NSFloatingWindowLevel;
-    self.panel.minSize = NSMakeSize(420, 350);
+    self.panel.minSize = NSMakeSize(620, 350);
     self.panel.delegate = self;
     self.panel.releasedWhenClosed = NO;
 
@@ -622,8 +790,29 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     [self.deleteResultsButton setContentHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
     [row2 addSubview:self.deleteResultsButton];
 
-    // Delete silences button
-    self.deleteSilencesButton = [NSButton buttonWithTitle:@"Delete Silences"
+    // Audio-first silence controls. Detection is independent of transcription:
+    // FFmpeg measures the actual source ranges used by the current timeline.
+    self.silencePresetPopup = [[NSPopUpButton alloc] init];
+    self.silencePresetPopup.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.silencePresetPopup addItemsWithTitles:@[@"Conservative", @"Balanced", @"Aggressive"]];
+    [self.silencePresetPopup selectItemWithTitle:@"Aggressive"];
+    self.silencePresetPopup.target = self;
+    self.silencePresetPopup.action = @selector(silencePresetChanged:);
+    self.silencePresetPopup.controlSize = NSControlSizeSmall;
+    self.silencePresetPopup.toolTip = @"Clear-voice sensitivity and protected speech handles";
+    [self.silencePresetPopup setContentHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [row2 addSubview:self.silencePresetPopup];
+
+    self.detectSilencesButton = [NSButton buttonWithTitle:@"Detect Voice"
+                                                    target:self
+                                                    action:@selector(detectSilencesClicked:)];
+    self.detectSilencesButton.translatesAutoresizingMaskIntoConstraints = NO;
+    self.detectSilencesButton.bezelStyle = NSBezelStyleRounded;
+    self.detectSilencesButton.toolTip = @"Keep Silero/FFmpeg-agreed voice with protected phoneme edges; no transcription required";
+    [self.detectSilencesButton setContentHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [row2 addSubview:self.detectSilencesButton];
+
+    self.deleteSilencesButton = [NSButton buttonWithTitle:@"Remove Non-Voice"
                                                    target:self
                                                    action:@selector(deleteSilencesClicked:)];
     self.deleteSilencesButton.translatesAutoresizingMaskIntoConstraints = NO;
@@ -778,7 +967,13 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
         [self.deleteResultsButton.leadingAnchor constraintEqualToAnchor:row2.leadingAnchor],
         [self.deleteResultsButton.centerYAnchor constraintEqualToAnchor:row2.centerYAnchor],
 
-        [self.deleteSilencesButton.leadingAnchor constraintEqualToAnchor:self.deleteResultsButton.trailingAnchor constant:6],
+        [self.silencePresetPopup.leadingAnchor constraintEqualToAnchor:self.deleteResultsButton.trailingAnchor constant:6],
+        [self.silencePresetPopup.centerYAnchor constraintEqualToAnchor:row2.centerYAnchor],
+
+        [self.detectSilencesButton.leadingAnchor constraintEqualToAnchor:self.silencePresetPopup.trailingAnchor constant:6],
+        [self.detectSilencesButton.centerYAnchor constraintEqualToAnchor:row2.centerYAnchor],
+
+        [self.deleteSilencesButton.leadingAnchor constraintEqualToAnchor:self.detectSilencesButton.trailingAnchor constant:6],
         [self.deleteSilencesButton.centerYAnchor constraintEqualToAnchor:row2.centerYAnchor],
 
         [self.statusLabel.leadingAnchor constraintEqualToAnchor:self.deleteSilencesButton.trailingAnchor constant:8],
@@ -830,6 +1025,22 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
 
     [self setupPanelIfNeeded];
     [self restorePersistedStateForCurrentSequenceIfNeeded];
+    if (self.mutableSilences.count > 0) {
+        [self rebuildTextView];
+        NSUInteger confirmed = 0;
+        double removable = 0.0;
+        for (SpliceKitTranscriptSilence *silence in self.mutableSilences) {
+            if (silence.audioDetected && silence.selectedForRemoval && silence.confidence >= 0.9) {
+                confirmed++;
+                removable += MAX(0.0, silence.duration - self.audioSilenceRoomTone);
+            }
+        }
+        self.deleteSilencesButton.enabled = confirmed > 0;
+        if (confirmed > 0) {
+            self.deleteSilencesButton.title = [NSString stringWithFormat:@"Remove %lu (%.0fs)",
+                (unsigned long)confirmed, removable];
+        }
+    }
     [self.panel makeKeyAndOrderFront:nil];
     if (self.status == SpliceKitTranscriptStatusReady && self.mutableWords.count > 0) {
         [self startPlayheadTimer];
@@ -879,7 +1090,7 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     id sequence = [self currentSequence];
 
     // No sequence (empty timeline or no project) — clear stale data
-    if (!sequence && self.mutableWords.count > 0) {
+    if (!sequence && (self.mutableWords.count > 0 || self.mutableSilences.count > 0)) {
         @synchronized (self.mutableWords) {
             [self.mutableWords removeAllObjects];
         }
@@ -887,6 +1098,8 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
         self.fullText = nil;
         self.status = SpliceKitTranscriptStatusIdle;
         self.lastRestoredSequenceKey = nil;
+        self.audioSilenceDetectionSequence = nil;
+        self.audioSilenceDetectionTimelineFingerprint = nil;
         if (self.panel) {
             [self rebuildTextView];
             self.deleteSilencesButton.enabled = NO;
@@ -902,7 +1115,7 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
 
         // If we have words in memory, check they belong to the current sequence.
         // After restart lastRestoredSequenceKey is nil — always validate in that case.
-        if (self.mutableWords.count > 0) {
+        if (self.mutableWords.count > 0 || self.mutableSilences.count > 0) {
             BOOL keyMismatch = NO;
             if (self.lastRestoredSequenceKey.length == 0) {
                 // After restart: we have words but don't know which sequence they're from.
@@ -938,7 +1151,7 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
 
     NSMutableDictionary *section = [@{
         @"status": @"ready",
-        @"formatVersion": @2,
+        @"formatVersion": @3,
         @"frameRate": @(self.frameRate),
         @"silenceThreshold": @(self.silenceThreshold),
         @"speakerDetectionEnabled": @(self.speakerDetectionEnabled),
@@ -1005,6 +1218,8 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
         self.fullText = nil;
         self.status = SpliceKitTranscriptStatusIdle;
         self.lastRestoredSequenceKey = sequenceKey;
+        self.audioSilenceDetectionSequence = nil;
+        self.audioSilenceDetectionTimelineFingerprint = nil;
         if (self.panel) {
             [self rebuildTextView];
             self.deleteSilencesButton.enabled = NO;
@@ -1044,6 +1259,8 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
         return;
     }
 
+    self.audioSilenceDetectionSequence = nil;
+    self.audioSilenceDetectionTimelineFingerprint = nil;
     self.suppressPersistenceWrites = YES;
     @synchronized (self.mutableWords) {
         [self.mutableWords removeAllObjects];
@@ -1061,11 +1278,29 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
         }
     }
 
+    if (formatVersion >= 3 && transcript[@"silenceThreshold"]) {
+        self.silenceThreshold = [transcript[@"silenceThreshold"] doubleValue];
+    } else {
+        // Migrate the old 300ms default to the safer destructive-edit default.
+        self.silenceThreshold = kSpliceKitDefaultSilenceThreshold;
+    }
+
     [self.mutableSilences removeAllObjects];
-    NSArray *silenceDicts = [transcript[@"silences"] isKindOfClass:[NSArray class]] ? transcript[@"silences"] : nil;
+    // Version 3 records whether a pause came from a real inter-word gap or
+    // from a timing heuristic.  Older cached pauses cannot be classified
+    // safely, so rebuild them from the persisted words.
+    NSArray *silenceDicts = (formatVersion >= 3 && [transcript[@"silences"] isKindOfClass:[NSArray class]])
+        ? transcript[@"silences"] : nil;
     for (NSDictionary *silenceDict in silenceDicts) {
         SpliceKitTranscriptSilence *silence = SpliceKitTranscript_silenceFromDictionary(silenceDict);
-        if (silence) [self.mutableSilences addObject:silence];
+        if (silence) {
+            // The transcript may be cached, but an audio mask is destructive
+            // timeline state and must be remeasured after every restore.
+            silence.audioDetected = NO;
+            silence.selectedForRemoval = NO;
+            silence.confidence = 0.0;
+            [self.mutableSilences addObject:silence];
+        }
     }
     if (self.mutableSilences.count == 0) {
         [self detectSilences];
@@ -1082,7 +1317,6 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
         self.parakeetModelVersion = transcript[@"parakeetModel"];
     }
     if (transcript[@"frameRate"]) self.frameRate = [transcript[@"frameRate"] doubleValue];
-    if (transcript[@"silenceThreshold"]) self.silenceThreshold = [transcript[@"silenceThreshold"] doubleValue];
     self.speakerDetectionEnabled = [transcript[@"speakerDetectionEnabled"] boolValue];
     self.fullText = [transcript[@"text"] isKindOfClass:[NSString class]] ? transcript[@"text"] : nil;
     self.status = SpliceKitTranscriptStatusReady;
@@ -1263,8 +1497,69 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     });
 }
 
+- (void)silencePresetChanged:(NSPopUpButton *)sender {
+    NSString *preset = sender.selectedItem.title ?: @"Balanced";
+    if ([preset isEqualToString:@"Conservative"]) {
+        self.audioSilenceNoiseDB = -45.0;
+        self.audioVoiceVADThreshold = 0.15;
+        self.audioVoicePadding = 0.150;
+    } else if ([preset isEqualToString:@"Aggressive"]) {
+        self.audioSilenceNoiseDB = -35.0;
+        self.audioVoiceVADThreshold = 0.25;
+        self.audioVoicePadding = kSpliceKitMinimumVoiceEdgeProtectionSeconds;
+    } else {
+        self.audioSilenceNoiseDB = -40.0;
+        self.audioVoiceVADThreshold = 0.20;
+        self.audioVoicePadding = 0.120;
+    }
+    self.silenceThreshold = 1.0 / MAX(self.frameRate, 1.0);
+    self.audioSilenceConfirmDB = self.audioSilenceNoiseDB;
+    self.audioSilenceRoomTone = 0.0;
+    [self updateStatusUI:[NSString stringWithFormat:
+        @"%@ — %.0f dB + %.2f VAD, %.0f ms voice-edge protection", preset,
+        self.audioSilenceNoiseDB, self.audioVoiceVADThreshold,
+        self.audioVoicePadding * 1000.0]];
+}
+
+- (void)detectSilencesClicked:(id)sender {
+    if (self.audioSilenceDetectionRunning) return;
+    [self detectAudioSilencesWithCompletion:nil];
+}
+
 - (void)deleteSilencesClicked:(id)sender {
-    [self deleteAllSilences];
+    NSArray<SpliceKitTranscriptSilence *> *confirmed = [self.mutableSilences filteredArrayUsingPredicate:
+        [NSPredicate predicateWithBlock:^BOOL(SpliceKitTranscriptSilence *silence, NSDictionary *bindings) {
+            return silence.audioDetected && silence.selectedForRemoval && silence.confidence >= 0.9;
+        }]];
+    if (confirmed.count == 0) {
+        [self updateStatusUI:@"Detect timeline audio before removing silences."];
+        NSBeep();
+        return;
+    }
+
+    double removable = 0.0;
+    for (SpliceKitTranscriptSilence *silence in confirmed) {
+        removable += silence.duration;
+    }
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = [NSString stringWithFormat:@"Remove %lu confirmed silences?",
+                         (unsigned long)confirmed.count];
+    alert.informativeText = [NSString stringWithFormat:
+        @"About %.1f seconds will be removed. Every detected voice region keeps at least %.0f ms and three video frames of edge protection; cut boundaries are rounded away from protected speech.",
+        removable, self.audioVoicePadding * 1000.0];
+    [alert addButtonWithTitle:@"Remove Non-Voice"];
+    [alert addButtonWithTitle:@"Cancel"];
+    if ([alert runModal] == NSAlertFirstButtonReturn) {
+        NSDictionary *result = [self deleteSilencesLongerThan:self.silenceThreshold
+                                               boundaryPadding:0.0
+                                               includeInferred:NO];
+        if (result[@"error"]) {
+            NSString *message = result[@"error"];
+            SpliceKit_log(@"[Transcript] Remove Non-Voice refused: %@", message);
+            [self updateStatusUI:message];
+            NSBeep();
+        }
+    }
 }
 
 - (void)prevResultClicked:(id)sender {
@@ -3267,6 +3562,714 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
 
 #pragma mark - Silence Detection
 
+- (NSString *)ffmpegExecutablePath {
+    NSArray<NSString *> *fixedCandidates = @[
+        @"/opt/homebrew/bin/ffmpeg",
+        @"/usr/local/bin/ffmpeg",
+        @"/usr/bin/ffmpeg",
+    ];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *path in fixedCandidates) {
+        if ([fm isExecutableFileAtPath:path]) return path;
+    }
+    for (NSString *directory in [[NSProcessInfo processInfo].environment[@"PATH"] componentsSeparatedByString:@":"]) {
+        NSString *path = [directory stringByAppendingPathComponent:@"ffmpeg"];
+        if ([fm isExecutableFileAtPath:path]) return path;
+    }
+    return nil;
+}
+
+- (NSString *)voiceActivityDetectorExecutablePath {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *frameworkResource = [[NSBundle mainBundle].privateFrameworksPath
+        stringByAppendingPathComponent:@"SpliceKit.framework/Versions/A/Resources/voice-activity-detector"];
+    NSString *sharedTool = [@"~/Applications/SpliceKit/tools/voice-activity-detector"
+        stringByExpandingTildeInPath];
+    for (NSString *path in @[frameworkResource ?: @"", sharedTool]) {
+        if ([fm isExecutableFileAtPath:path]) return path;
+    }
+    return nil;
+}
+
+- (NSArray<NSDictionary *> *)audioClipInfosFromFCPXMLWithError:(NSString **)errorOut {
+    NSString *xmlPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"splicekit-silence-%@.fcpxml", NSUUID.UUID.UUIDString]];
+    NSDictionary *exportResult = SpliceKit_handleFCPXMLExport(@{@"path": xmlPath});
+    if (exportResult[@"error"]) {
+        if (errorOut) *errorOut = exportResult[@"error"];
+        return nil;
+    }
+
+    NSData *data = [NSData dataWithContentsOfFile:xmlPath];
+    [[NSFileManager defaultManager] removeItemAtPath:xmlPath error:nil];
+    if (!data) {
+        if (errorOut) *errorOut = @"FCPXML export produced no readable data";
+        return nil;
+    }
+    NSError *xmlError = nil;
+    NSXMLDocument *document = [[NSXMLDocument alloc] initWithData:data options:0 error:&xmlError];
+    if (!document) {
+        if (errorOut) *errorOut = xmlError.localizedDescription ?: @"Unable to parse FCPXML";
+        return nil;
+    }
+
+    NSMutableDictionary<NSString *, NSXMLElement *> *assets = [NSMutableDictionary dictionary];
+    for (NSXMLElement *asset in [document nodesForXPath:@"/fcpxml/resources/asset" error:nil]) {
+        NSString *assetID = [[asset attributeForName:@"id"] stringValue];
+        if (assetID.length > 0) assets[assetID] = asset;
+    }
+
+    NSArray<NSXMLElement *> *sequenceNodes = [document nodesForXPath:@"//project/sequence" error:nil];
+    NSXMLElement *sequenceNode = sequenceNodes.firstObject;
+    if (!sequenceNode) {
+        if (errorOut) *errorOut = @"FCPXML did not contain the active project sequence";
+        return nil;
+    }
+    double sequenceDuration = SpliceKitTranscript_secondsFromFCPXMLTime(
+        [[sequenceNode attributeForName:@"duration"] stringValue]);
+    NSXMLElement *projectNode = (NSXMLElement *)sequenceNode.parent;
+    NSString *sequenceUID = [[projectNode attributeForName:@"uid"] stringValue] ?: @"";
+    NSString *sequenceName = [[projectNode attributeForName:@"name"] stringValue] ?: @"";
+    if (sequenceDuration <= 0.0) {
+        if (errorOut) *errorOut = @"FCPXML active sequence has no valid duration";
+        return nil;
+    }
+
+    NSMutableDictionary<NSString *, NSXMLElement *> *formats = [NSMutableDictionary dictionary];
+    for (NSXMLElement *format in [document nodesForXPath:@"/fcpxml/resources/format" error:nil]) {
+        NSString *formatID = [[format attributeForName:@"id"] stringValue];
+        if (formatID.length > 0) formats[formatID] = format;
+    }
+    NSXMLElement *sequenceFormat = formats[[[sequenceNode attributeForName:@"format"] stringValue]];
+    double sequenceFrameDuration = SpliceKitTranscript_secondsFromFCPXMLTime(
+        [[sequenceFormat attributeForName:@"frameDuration"] stringValue]);
+    if (sequenceFrameDuration <= 0.0) sequenceFrameDuration = 1.0 / MAX(self.frameRate, 1.0);
+
+    NSMutableArray<NSDictionary *> *clipInfos = [NSMutableArray array];
+    NSUInteger skippedInactiveAudioRanges = 0;
+    NSArray<NSXMLElement *> *spineItems = [sequenceNode nodesForXPath:@"./spine/*" error:nil];
+    for (NSXMLElement *item in spineItems) {
+        NSString *elementName = item.name;
+        // deleteTimelineRange can select one exact primary-storyline object.
+        // Gaps, transitions, compounds, multicam clips, auditions and unknown
+        // container types need different mapping/edit semantics, so fail closed
+        // instead of silently building ranges across them.
+        if (![elementName isEqualToString:@"sync-clip"] &&
+            ![elementName isEqualToString:@"asset-clip"]) {
+            if (errorOut) *errorOut = [NSString stringWithFormat:
+                @"Silence removal does not yet support %@ timeline items", elementName];
+            return nil;
+        }
+
+        BOOL hasRetime = [item nodesForXPath:@".//timeMap" error:nil].count > 0;
+        BOOL hasMutedRange = [item nodesForXPath:@".//mute" error:nil].count > 0;
+        BOOL hasAudioFilter = [item nodesForXPath:@".//filter-audio" error:nil].count > 0;
+        BOOL hasVolumeAdjustment = [item nodesForXPath:@".//adjust-volume" error:nil].count > 0;
+        BOOL hasChannelOverrides = [item nodesForXPath:@".//audio-channel-source" error:nil].count > 0;
+        BOOL hasSplitAudio = [[item attributeForName:@"audioStart"] stringValue].length > 0 ||
+            [[item attributeForName:@"audioDuration"] stringValue].length > 0 ||
+            [item nodesForXPath:@".//*[@audioStart]" error:nil].count > 0 ||
+            [item nodesForXPath:@".//*[@audioDuration]" error:nil].count > 0;
+        if (hasRetime || hasMutedRange || hasAudioFilter || hasVolumeAdjustment ||
+            hasChannelOverrides || hasSplitAudio) {
+            if (errorOut) *errorOut = @"Silence removal requires unretimed audio without split edits, channel overrides, mute ranges, volume automation, or audio filters";
+            return nil;
+        }
+        if ([elementName isEqualToString:@"asset-clip"] &&
+            [item nodesForXPath:@".//*[@lane]" error:nil].count > 0) {
+            if (errorOut) *errorOut = @"Silence removal does not yet support connected media on an asset clip";
+            return nil;
+        }
+
+        double timelineStart = SpliceKitTranscript_secondsFromFCPXMLTime([[item attributeForName:@"offset"] stringValue]);
+        double duration = SpliceKitTranscript_secondsFromFCPXMLTime([[item attributeForName:@"duration"] stringValue]);
+        if (duration <= 0.0) continue;
+        NSUInteger itemSourceCountBefore = clipInfos.count;
+
+        NSArray<NSXMLElement *> *references = nil;
+        if ([elementName isEqualToString:@"asset-clip"]) {
+            references = @[item];
+        } else {
+            references = [item nodesForXPath:@".//asset-clip" error:nil];
+        }
+        NSXMLElement *topReference = references.firstObject;
+        if (!topReference || ([elementName isEqualToString:@"sync-clip"] && topReference.parent != item)) {
+            if (errorOut) *errorOut = @"Synchronized clip audio nesting is not supported by the exact source mapper";
+            return nil;
+        }
+        NSXMLElement *topAsset = topReference
+            ? assets[[[topReference attributeForName:@"ref"] stringValue]] : nil;
+        double topOrigin = SpliceKitTranscript_secondsFromFCPXMLTime(
+            [[topAsset attributeForName:@"start"] stringValue]);
+        double topOffset = SpliceKitTranscript_secondsFromFCPXMLTime(
+            [[topReference attributeForName:@"offset"] stringValue]);
+        NSString *topReferenceStartValue = [[topReference attributeForName:@"start"] stringValue];
+        double topReferenceStart = topReferenceStartValue.length > 0
+            ? SpliceKitTranscript_secondsFromFCPXMLTime(topReferenceStartValue)
+            : topOrigin;
+        double syncStart = SpliceKitTranscript_secondsFromFCPXMLTime(
+            [[item attributeForName:@"start"] stringValue]);
+        BOOL synchronizedClip = [elementName isEqualToString:@"sync-clip"];
+        BOOL storylineAudioInactive = synchronizedClip &&
+            SpliceKitTranscript_syncSourceAudioIsExplicitlyInactive(item, @"storyline");
+        BOOL connectedAudioInactive = synchronizedClip &&
+            SpliceKitTranscript_syncSourceAudioIsExplicitlyInactive(item, @"connected");
+        NSMutableSet<NSString *> *itemSources = [NSMutableSet set];
+
+        // A synchronized clip can contain camera audio plus one or more
+        // external sources. Preserve voice found in any enabled source, using
+        // each source's exact sync offset. Choosing only the first waveform was
+        // the source of incorrect behavior on synchronized clips.
+        for (NSXMLElement *reference in references) {
+            if (reference != topReference && reference.parent != topReference) {
+                if (errorOut) *errorOut = @"Synchronized audio nested more than one level is not supported";
+                return nil;
+            }
+            // sourceID="storyline" describes the top reference. Its audio can
+            // be disabled independently of the asset-clip's enabled attribute.
+            if (reference == topReference && storylineAudioInactive) {
+                skippedInactiveAudioRanges++;
+                continue;
+            }
+            if (reference != topReference && connectedAudioInactive) {
+                skippedInactiveAudioRanges++;
+                continue;
+            }
+            NSString *enabled = [[reference attributeForName:@"enabled"] stringValue];
+            if ([enabled isEqualToString:@"0"]) continue;
+            NSXMLElement *asset = assets[[[reference attributeForName:@"ref"] stringValue]];
+            if (![[[asset attributeForName:@"hasAudio"] stringValue] boolValue]) continue;
+            if (reference != topReference &&
+                [[[asset attributeForName:@"hasVideo"] stringValue] boolValue]) {
+                if (errorOut) *errorOut = @"Connected video inside a synchronized clip is not an audio sync source";
+                return nil;
+            }
+
+            NSXMLElement *mediaRep = (NSXMLElement *)[[asset elementsForName:@"media-rep"] firstObject];
+            NSString *sourceURL = [[mediaRep attributeForName:@"src"] stringValue];
+            NSURL *url = sourceURL.length > 0 ? [NSURL URLWithString:sourceURL] : nil;
+            if (url.path.length == 0) continue;
+
+            double assetOrigin = SpliceKitTranscript_secondsFromFCPXMLTime(
+                [[asset attributeForName:@"start"] stringValue]);
+            double sourceDuration = SpliceKitTranscript_secondsFromFCPXMLTime(
+                [[asset attributeForName:@"duration"] stringValue]);
+            NSString *referenceStartValue = [[reference attributeForName:@"start"] stringValue];
+            double referenceStart = referenceStartValue.length > 0
+                ? SpliceKitTranscript_secondsFromFCPXMLTime(referenceStartValue)
+                : assetOrigin;
+            double referenceDuration = SpliceKitTranscript_secondsFromFCPXMLTime(
+                [[reference attributeForName:@"duration"] stringValue]);
+            if (referenceDuration <= 0.0) referenceDuration = sourceDuration;
+
+            double fileStart = 0.0;
+            double mappedTimelineStart = timelineStart;
+            double mappedDuration = duration;
+            if ([elementName isEqualToString:@"sync-clip"]) {
+                // Convert each source's placement into the synchronized clip's
+                // local time domain. A nested source's offset is expressed in
+                // the top asset-clip's local timeline, whose origin is
+                // topReferenceStart. The previous implementation added this
+                // displacement to syncStart; FCPXML requires subtracting it.
+                double sourcePlacementStart = topOffset;
+                if (reference == topReference) {
+                    sourcePlacementStart = topOffset;
+                } else {
+                    double nestedOffset = SpliceKitTranscript_secondsFromFCPXMLTime(
+                        [[reference attributeForName:@"offset"] stringValue]);
+                    sourcePlacementStart = topOffset + nestedOffset - topReferenceStart;
+                }
+
+                // A source may begin after the synchronized clip or end before
+                // it. Intersect coverage instead of clamping negative file time:
+                // clamping alone incorrectly maps source time zero to timeline
+                // zero and recreates the same constant timing displacement.
+                double overlapStart = MAX(syncStart, sourcePlacementStart);
+                double overlapEnd = MIN(syncStart + duration,
+                    sourcePlacementStart + referenceDuration);
+                if (overlapEnd <= overlapStart) continue;
+                mappedTimelineStart = timelineStart + overlapStart - syncStart;
+                mappedDuration = overlapEnd - overlapStart;
+                fileStart = referenceStart - assetOrigin + overlapStart - sourcePlacementStart;
+            } else {
+                fileStart = referenceStart - assetOrigin;
+                mappedDuration = MIN(duration, MAX(0.0, sourceDuration - fileStart));
+                if (mappedDuration <= 0.0) continue;
+            }
+            fileStart = MAX(0.0, fileStart);
+            NSString *sourceKey = [NSString stringWithFormat:@"%@|%.6f|%.6f|%.6f",
+                url.path, fileStart, mappedTimelineStart, mappedDuration];
+            if ([itemSources containsObject:sourceKey]) continue;
+            [itemSources addObject:sourceKey];
+
+            [clipInfos addObject:@{
+                @"timelineStart": @(mappedTimelineStart),
+                @"duration": @(mappedDuration),
+                @"mediaURL": url,
+                @"audioFileStart": @(fileStart),
+                @"sourceDuration": @(sourceDuration),
+                @"sequenceDuration": @(sequenceDuration),
+                @"sequenceFrameDuration": @(sequenceFrameDuration),
+                @"sequenceUID": sequenceUID,
+                @"sequenceName": sequenceName,
+                @"timelineItemStart": @(timelineStart),
+                @"timelineItemDuration": @(duration),
+                @"audioSource": @"fcpxml",
+            }];
+        }
+        if (clipInfos.count == itemSourceCountBefore) {
+            if (errorOut) *errorOut = [NSString stringWithFormat:
+                @"%@ has no enabled, readable audio source", elementName];
+            return nil;
+        }
+    }
+
+    if (clipInfos.count == 0 && errorOut) {
+        *errorOut = @"FCPXML did not expose any timeline audio ranges";
+    }
+    SpliceKit_log(@"[Transcript] FCPXML audio plan: %lu ranges (%lu inactive synchronized audio ranges skipped)",
+        (unsigned long)clipInfos.count, (unsigned long)skippedInactiveAudioRanges);
+    return clipInfos.count > 0 ? clipInfos : nil;
+}
+
+- (double)fileRelativeStartForClipInfo:(NSDictionary *)clipInfo {
+    // For synchronized clips, collection time and source-file time differ by
+    // the sync offset. The collection contributes the changing trim position
+    // after every blade; the inner media object contributes the fixed sync
+    // offset. Using only the inner object repeats the same source range for
+    // every synchronized-clip segment.
+    id mediaObject = clipInfo[@"mediaObject"];
+    id timelineObject = clipInfo[@"timelineObject"];
+    double collectionRelative = MAX(0.0,
+        [clipInfo[@"trimStart"] doubleValue] - [clipInfo[@"mediaOrigin"] doubleValue]);
+    SEL clippedSel = NSSelectorFromString(@"clippedRange");
+    SEL unclippedSel = NSSelectorFromString(@"unclippedRange");
+    if (mediaObject && [mediaObject respondsToSelector:clippedSel] &&
+        [mediaObject respondsToSelector:unclippedSel]) {
+        SpliceKitTranscript_CMTimeRange clipped = {0};
+        SpliceKitTranscript_CMTimeRange unclipped = {0};
+        for (NSUInteger pass = 0; pass < 2; pass++) {
+            SEL selector = pass == 0 ? clippedSel : unclippedSel;
+            NSMethodSignature *signature = [mediaObject methodSignatureForSelector:selector];
+            if (!signature || signature.methodReturnLength != sizeof(SpliceKitTranscript_CMTimeRange)) break;
+            NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
+            invocation.target = mediaObject;
+            invocation.selector = selector;
+            [invocation invoke];
+            if (pass == 0) [invocation getReturnValue:&clipped];
+            else [invocation getReturnValue:&unclipped];
+        }
+        double mediaRelative = CMTimeToSeconds(clipped.start) - CMTimeToSeconds(unclipped.start);
+        if (mediaRelative >= 0.0) {
+            return timelineObject != mediaObject
+                ? collectionRelative + mediaRelative
+                : mediaRelative;
+        }
+    }
+    return collectionRelative;
+}
+
+- (NSArray<NSDictionary *> *)ffmpegSilencesForPath:(NSString *)path
+                                         trimStart:(double)trimStart
+                                           duration:(double)duration
+                                          threshold:(double)thresholdDB
+                                        minDuration:(double)minDuration
+                                             ffmpeg:(NSString *)ffmpegPath
+                                              error:(NSString **)errorOut {
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = ffmpegPath;
+    task.arguments = @[
+        @"-hide_banner", @"-nostats",
+        // FCPXML preferentially resolves the audio-only dialogue asset (WAV in
+        // synchronized clips), so input-side seeking is sample-accurate and
+        // silencedetect reports clip-relative timestamps. Output-side seeking
+        // runs the filter before the seek and reports absolute source times.
+        @"-ss", [NSString stringWithFormat:@"%.6f", MAX(0.0, trimStart)],
+        @"-t", [NSString stringWithFormat:@"%.6f", MAX(0.0, duration)],
+        @"-i", path, @"-vn",
+        @"-af", [NSString stringWithFormat:@"silencedetect=noise=%.1fdB:d=%.3f", thresholdDB, minDuration],
+        @"-f", @"null", @"-",
+    ];
+    NSPipe *stderrPipe = [NSPipe pipe];
+    task.standardError = stderrPipe;
+    task.standardOutput = [NSPipe pipe];
+    @try {
+        [task launch];
+        [task waitUntilExit];
+    } @catch (NSException *exception) {
+        if (errorOut) *errorOut = exception.reason ?: @"Unable to launch FFmpeg";
+        return nil;
+    }
+    NSData *data = [stderrPipe.fileHandleForReading readDataToEndOfFile];
+    NSString *output = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+    if (task.terminationStatus != 0) {
+        if (errorOut) *errorOut = [NSString stringWithFormat:@"FFmpeg exited with status %d: %@",
+            task.terminationStatus, output.length > 500 ? [output substringFromIndex:output.length - 500] : output];
+        return nil;
+    }
+
+    NSRegularExpression *startRE = [NSRegularExpression regularExpressionWithPattern:@"silence_start: ([0-9.]+)" options:0 error:nil];
+    NSRegularExpression *endRE = [NSRegularExpression regularExpressionWithPattern:@"silence_end: ([0-9.]+)" options:0 error:nil];
+    NSMutableArray<NSDictionary *> *ranges = [NSMutableArray array];
+    __block NSNumber *pendingStart = nil;
+    [output enumerateLinesUsingBlock:^(NSString *line, BOOL *stop) {
+        NSTextCheckingResult *startMatch = [startRE firstMatchInString:line options:0 range:NSMakeRange(0, line.length)];
+        if (startMatch) {
+            pendingStart = @([[line substringWithRange:[startMatch rangeAtIndex:1]] doubleValue]);
+        }
+        NSTextCheckingResult *endMatch = [endRE firstMatchInString:line options:0 range:NSMakeRange(0, line.length)];
+        if (endMatch && pendingStart) {
+            double end = [[line substringWithRange:[endMatch rangeAtIndex:1]] doubleValue];
+            if (end > pendingStart.doubleValue) {
+                [ranges addObject:@{@"start": pendingStart, @"end": @(MIN(end, duration))}];
+            }
+            pendingStart = nil;
+        }
+    }];
+    if (pendingStart && duration > pendingStart.doubleValue) {
+        [ranges addObject:@{@"start": pendingStart, @"end": @(duration)}];
+    }
+    return ranges;
+}
+
+- (NSArray<NSDictionary *> *)vadSpeechForPath:(NSString *)path
+                                      detector:(NSString *)detectorPath
+                                     threshold:(double)threshold
+                                         error:(NSString **)errorOut {
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = detectorPath;
+    task.arguments = @[
+        @"vad-analyze", path,
+        @"--threshold", [NSString stringWithFormat:@"%.3f", threshold],
+        @"--neg-threshold", @"0.10",
+        @"--min-speech-ms", @"50",
+        @"--min-silence-ms", @"300",
+        @"--max-speech-s", @"1000",
+        @"--pad-ms", @"0",
+        @"--compute-units", @"all",
+    ];
+    NSPipe *stdoutPipe = [NSPipe pipe];
+    NSPipe *stderrPipe = [NSPipe pipe];
+    task.standardOutput = stdoutPipe;
+    task.standardError = stderrPipe;
+    @try {
+        [task launch];
+        [task waitUntilExit];
+    } @catch (NSException *exception) {
+        if (errorOut) *errorOut = exception.reason ?: @"Unable to launch voice activity detector";
+        return nil;
+    }
+    NSString *output = [[NSString alloc] initWithData:
+        [stdoutPipe.fileHandleForReading readDataToEndOfFile] encoding:NSUTF8StringEncoding] ?: @"";
+    NSString *diagnostic = [[NSString alloc] initWithData:
+        [stderrPipe.fileHandleForReading readDataToEndOfFile] encoding:NSUTF8StringEncoding] ?: @"";
+    if (task.terminationStatus != 0 || ![output containsString:@"VAD_SUMMARY"]) {
+        if (errorOut) *errorOut = [NSString stringWithFormat:@"Voice activity detector failed: %@",
+            diagnostic.length > 600 ? [diagnostic substringFromIndex:diagnostic.length - 600] : diagnostic];
+        return nil;
+    }
+
+    NSRegularExpression *segmentRE = [NSRegularExpression regularExpressionWithPattern:
+        @"VAD_SEGMENT .* start=([0-9.]+) end=([0-9.]+)" options:0 error:nil];
+    NSMutableArray *ranges = [NSMutableArray array];
+    for (NSTextCheckingResult *match in [segmentRE matchesInString:output options:0
+                                                            range:NSMakeRange(0, output.length)]) {
+        double start = [[output substringWithRange:[match rangeAtIndex:1]] doubleValue];
+        double end = [[output substringWithRange:[match rangeAtIndex:2]] doubleValue];
+        if (end > start) [ranges addObject:@{@"start": @(start), @"end": @(end)}];
+    }
+    return SpliceKitTranscript_mergeTimeRanges(ranges, 0.0);
+}
+
+- (void)detectAudioSilencesWithCompletion:(void (^)(NSDictionary *result))completion {
+    if (self.audioSilenceDetectionRunning) {
+        if (completion) completion(@{@"error": @"Audio silence detection is already running"});
+        return;
+    }
+    // Use the measured VAD/energy intersection as the high-confidence voice
+    // core. Edge protection is applied after the exact sequence frame duration
+    // is known; zero-buffer destructive edits clip quiet phoneme boundaries.
+    self.silenceThreshold = 1.0 / MAX(self.frameRate, 1.0);
+    self.audioSilenceRoomTone = 0.0;
+    NSString *ffmpegPath = [self ffmpegExecutablePath];
+    if (!ffmpegPath) {
+        NSDictionary *result = @{ @"error": @"FFmpeg was not found in /opt/homebrew/bin, /usr/local/bin, or PATH" };
+        [self updateStatusUI:result[@"error"]];
+        if (completion) completion(result);
+        return;
+    }
+    NSString *vadPath = [self voiceActivityDetectorExecutablePath];
+    if (!vadPath) {
+        NSDictionary *result = @{ @"error": @"voice-activity-detector is not installed; deploy the current SpliceKit build" };
+        [self updateStatusUI:result[@"error"]];
+        if (completion) completion(result);
+        return;
+    }
+
+    __block NSArray *clipInfos = nil;
+    __block NSString *collectError = nil;
+    __block id detectionSequence = nil;
+    SpliceKit_executeOnMainThread(^{
+        id timeline = [self getActiveTimelineModule];
+        detectionSequence = [timeline respondsToSelector:@selector(sequence)]
+            ? ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence)) : nil;
+        if (!detectionSequence) {
+            collectError = @"No active project sequence";
+            return;
+        }
+        NSDictionary *sequenceState = SpliceKit_loadSequenceState(detectionSequence);
+        NSString *cacheKey = [sequenceState[@"sequenceIdentity"] isKindOfClass:[NSDictionary class]]
+            ? sequenceState[@"sequenceIdentity"][@"cacheKey"] : nil;
+        if (cacheKey.length > 0) self.lastRestoredSequenceKey = cacheKey;
+        // FCPXML preserves synchronized-clip nesting and identifies the actual
+        // external dialogue asset. ObjC collection traversal only exposes the
+        // first media component, which is commonly the camera .mov rather than
+        // the audio file whose waveform the editor sees.
+        clipInfos = [self audioClipInfosFromFCPXMLWithError:&collectError];
+        // A non-empty error means FCPXML positively identified an unsupported
+        // or unsafe structure. Do not fall back to the less precise ObjC path.
+        if (clipInfos.count > 0 || collectError.length > 0) return;
+
+        id sequence = detectionSequence;
+        id primary = [sequence respondsToSelector:@selector(primaryObject)]
+            ? ((id (*)(id, SEL))objc_msgSend)(sequence, @selector(primaryObject)) : nil;
+        NSArray *collected = [self collectClipInfosForSequence:sequence primaryObject:primary errorMessage:&collectError];
+        NSMutableArray *prepared = [NSMutableArray arrayWithCapacity:collected.count];
+        for (NSDictionary *clipInfo in collected) {
+            NSMutableDictionary *copy = [clipInfo mutableCopy];
+            copy[@"audioFileStart"] = @([self fileRelativeStartForClipInfo:clipInfo]);
+            [prepared addObject:copy];
+        }
+        clipInfos = [prepared copy];
+    });
+    if (!clipInfos) {
+        NSDictionary *result = @{ @"error": collectError ?: @"Unable to read the current timeline" };
+        [self updateStatusUI:result[@"error"]];
+        if (completion) completion(result);
+        return;
+    }
+
+    double exactFrameDuration = [clipInfos.firstObject[@"sequenceFrameDuration"] doubleValue];
+    if (exactFrameDuration > 0.0) {
+        self.frameRate = 1.0 / exactFrameDuration;
+        self.silenceThreshold = exactFrameDuration;
+    } else {
+        exactFrameDuration = 1.0 / MAX(self.frameRate, 1.0);
+    }
+    NSString *detectionFingerprint = SpliceKitTranscript_audioPlanFingerprint(clipInfos);
+    double energyThresholdDB = self.audioSilenceNoiseDB;
+    double vadThreshold = self.audioVoiceVADThreshold;
+    // Protect at least three frames even at low project frame rates, and at
+    // least 100 ms at high frame rates. This padding is applied to voice—not
+    // silence—so the resulting cut can never consume the protected handle.
+    double voicePadding = MAX(self.audioVoicePadding,
+        MAX(kSpliceKitMinimumVoiceEdgeProtectionSeconds,
+            kSpliceKitMinimumVoiceEdgeProtectionFrames * exactFrameDuration));
+    self.audioVoicePadding = voicePadding;
+    double minimumVoiceEvidence = self.audioVoiceMinimumEvidence;
+
+    self.audioSilenceDetectionRunning = YES;
+    self.audioSilenceDetectionSequence = nil;
+    self.audioSilenceDetectionTimelineFingerprint = nil;
+    self.detectSilencesButton.enabled = NO;
+    self.deleteSilencesButton.enabled = NO;
+    self.silencePresetPopup.enabled = NO;
+    self.spinner.hidden = NO;
+    [self.spinner startAnimation:nil];
+    [self updateStatusUI:@"Finding clear voice with Silero + FFmpeg..."];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSMutableDictionary<NSString *, NSMutableArray<NSDictionary *> *> *clipsByPath = [NSMutableDictionary dictionary];
+        NSMutableDictionary<NSString *, NSNumber *> *durationsByPath = [NSMutableDictionary dictionary];
+        double timelineDuration = 0.0;
+        for (NSDictionary *clipInfo in clipInfos) {
+            NSURL *url = clipInfo[@"mediaURL"];
+            NSString *path = url.path;
+            if (path.length == 0) continue;
+            if (!clipsByPath[path]) clipsByPath[path] = [NSMutableArray array];
+            [clipsByPath[path] addObject:clipInfo];
+            double sourceDuration = [clipInfo[@"sourceDuration"] doubleValue];
+            if (sourceDuration <= 0.0) {
+                sourceDuration = [clipInfo[@"audioFileStart"] doubleValue] + [clipInfo[@"duration"] doubleValue];
+            }
+            durationsByPath[path] = @(MAX(sourceDuration, [durationsByPath[path] doubleValue]));
+            timelineDuration = MAX(timelineDuration, [clipInfo[@"sequenceDuration"] doubleValue]);
+            timelineDuration = MAX(timelineDuration,
+                [clipInfo[@"timelineStart"] doubleValue] + [clipInfo[@"duration"] doubleValue]);
+        }
+
+        NSMutableArray<NSDictionary *> *mappedClearVoice = [NSMutableArray array];
+        __block NSString *lastError = nil;
+        for (NSString *path in clipsByPath) {
+            double sourceDuration = [durationsByPath[path] doubleValue];
+            if (sourceDuration <= 0.0) continue;
+            // FFmpeg defines where meaningful energy exists. Silero defines
+            // where speech-like timing exists. Neither may protect a range by
+            // itself: room tone triggered the VAD false positives that left the
+            // reported leading/trailing silence behind.
+            NSArray *energySilence = [self ffmpegSilencesForPath:path trimStart:0.0 duration:sourceDuration
+                threshold:energyThresholdDB minDuration:0.15 ffmpeg:ffmpegPath error:&lastError];
+            if (!energySilence) break;
+            NSArray *speech = [self vadSpeechForPath:path detector:vadPath
+                threshold:vadThreshold error:&lastError];
+            if (!speech) break;
+            NSArray *energyActive = SpliceKitTranscript_complementTimeRanges(
+                energySilence, 0.0, sourceDuration);
+            NSArray *agreement = SpliceKitTranscript_intersectTimeRanges(speech, energyActive);
+
+            NSMutableArray *clearVoice = [NSMutableArray array];
+            for (NSDictionary *range in agreement) {
+                if ([range[@"end"] doubleValue] - [range[@"start"] doubleValue]
+                    >= minimumVoiceEvidence) {
+                    [clearVoice addObject:range];
+                }
+            }
+
+            for (NSDictionary *clipInfo in clipsByPath[path]) {
+                double fileStart = [clipInfo[@"audioFileStart"] doubleValue];
+                double duration = [clipInfo[@"duration"] doubleValue];
+                double fileEnd = fileStart + duration;
+                double timelineStart = [clipInfo[@"timelineStart"] doubleValue];
+                for (NSDictionary *voice in clearVoice) {
+                    double overlapStart = MAX(fileStart, [voice[@"start"] doubleValue]);
+                    double overlapEnd = MIN(fileEnd, [voice[@"end"] doubleValue]);
+                    if (overlapEnd <= overlapStart) continue;
+                    [mappedClearVoice addObject:@{
+                        @"start": @(timelineStart + overlapStart - fileStart),
+                        @"end": @(timelineStart + overlapEnd - fileStart),
+                    }];
+                }
+            }
+        }
+
+        NSMutableArray *protectedVoice = [NSMutableArray array];
+        if (!lastError) {
+            for (NSDictionary *voice in mappedClearVoice) {
+                [protectedVoice addObject:@{
+                    @"start": @(MAX(0.0, [voice[@"start"] doubleValue] - voicePadding)),
+                    @"end": @(MIN(timelineDuration, [voice[@"end"] doubleValue] + voicePadding)),
+                }];
+            }
+        }
+        NSArray *mergedProtectedVoice = SpliceKitTranscript_mergeTimeRanges(protectedVoice, 0.0);
+        NSArray *logicalCandidates = lastError ? @[] : SpliceKitTranscript_complementTimeRanges(
+            mergedProtectedVoice, 0.0, timelineDuration);
+
+        // One delete operation must resolve to one exact primary-storyline
+        // object. Split a non-voice range at every original item boundary so a
+        // pause spanning an edit never becomes an ambiguous multi-item delete.
+        NSMutableSet<NSNumber *> *boundarySet = [NSMutableSet set];
+        for (NSDictionary *clipInfo in clipInfos) {
+            double itemStart = [clipInfo[@"timelineItemStart"] doubleValue];
+            double itemDuration = [clipInfo[@"timelineItemDuration"] doubleValue];
+            if (itemDuration <= 0.0) continue;
+            if (itemStart > 0.0 && itemStart < timelineDuration) [boundarySet addObject:@(itemStart)];
+            double itemEnd = itemStart + itemDuration;
+            if (itemEnd > 0.0 && itemEnd < timelineDuration) [boundarySet addObject:@(itemEnd)];
+        }
+        NSArray<NSNumber *> *itemBoundaries = [[boundarySet allObjects]
+            sortedArrayUsingSelector:@selector(compare:)];
+        NSMutableArray<NSDictionary *> *rawCandidates = [NSMutableArray array];
+        for (NSDictionary *candidate in logicalCandidates) {
+            double cursor = [candidate[@"start"] doubleValue];
+            double candidateEnd = [candidate[@"end"] doubleValue];
+            for (NSNumber *boundaryNumber in itemBoundaries) {
+                double boundary = boundaryNumber.doubleValue;
+                if (boundary <= cursor + 1e-9) continue;
+                if (boundary >= candidateEnd - 1e-9) break;
+                [rawCandidates addObject:@{@"start": @(cursor), @"end": @(boundary)}];
+                cursor = boundary;
+            }
+            if (candidateEnd > cursor + 1e-9) {
+                [rawCandidates addObject:@{@"start": @(cursor), @"end": @(candidateEnd)}];
+            }
+        }
+
+        NSMutableArray<SpliceKitTranscriptSilence *> *detected = [NSMutableArray array];
+        NSUInteger confirmedCount = 0;
+        double removableDuration = 0.0;
+        double frameDuration = exactFrameDuration;
+        for (NSDictionary *candidate in rawCandidates) {
+            // Round the non-voice range inward so a cut never crosses the
+            // frame-aware voice-edge protection applied above.
+            double start = ceil(([candidate[@"start"] doubleValue] / frameDuration) - 1e-9) * frameDuration;
+            double end = floor(([candidate[@"end"] doubleValue] / frameDuration) + 1e-9) * frameDuration;
+            start = MAX(0.0, start);
+            end = MIN(timelineDuration, end);
+            if (end - start < frameDuration - 1e-6) continue;
+            SpliceKitTranscriptSilence *silence = [[SpliceKitTranscriptSilence alloc] init];
+            silence.startTime = start;
+            silence.endTime = end;
+            silence.duration = end - start;
+            silence.audioDetected = YES;
+            silence.confidence = 1.0;
+            silence.selectedForRemoval = YES;
+            silence.afterWordIndex = NSNotFound;
+            for (SpliceKitTranscriptWord *word in self.mutableWords) {
+                if (word.endTime <= silence.startTime) silence.afterWordIndex = word.wordIndex;
+                else break;
+            }
+            if (silence.selectedForRemoval) {
+                confirmedCount++;
+                removableDuration += silence.duration;
+            }
+            [detected addObject:silence];
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            id activeTimeline = [self getActiveTimelineModule];
+            id activeSequence = [activeTimeline respondsToSelector:@selector(sequence)]
+                ? ((id (*)(id, SEL))objc_msgSend)(activeTimeline, @selector(sequence)) : nil;
+            if (activeSequence != detectionSequence) {
+                [self.mutableSilences removeAllObjects];
+                self.audioSilenceDetectionRunning = NO;
+                self.audioSilenceDetectionSequence = nil;
+                self.audioSilenceDetectionTimelineFingerprint = nil;
+                self.detectSilencesButton.enabled = YES;
+                self.deleteSilencesButton.enabled = NO;
+                self.silencePresetPopup.enabled = YES;
+                self.spinner.hidden = YES;
+                [self.spinner stopAnimation:nil];
+                NSString *staleError = @"Timeline changed during audio analysis; run Detect Audio again";
+                [self updateStatusUI:staleError];
+                if (completion) completion(@{@"status": @"error", @"error": staleError});
+                return;
+            }
+            [self.mutableSilences removeAllObjects];
+            [self.mutableSilences addObjectsFromArray:detected];
+            self.audioSilenceDetectionRunning = NO;
+            self.audioSilenceDetectionSequence = detectionSequence;
+            self.audioSilenceDetectionTimelineFingerprint = detectionFingerprint;
+            self.detectSilencesButton.enabled = YES;
+            self.silencePresetPopup.enabled = YES;
+            self.deleteSilencesButton.enabled = confirmedCount > 0;
+            self.deleteSilencesButton.title = [NSString stringWithFormat:@"Remove %lu (%.0fs)",
+                (unsigned long)confirmedCount, removableDuration];
+            self.spinner.hidden = YES;
+            [self.spinner stopAnimation:nil];
+            [self rebuildTextView];
+            NSString *status = [NSString stringWithFormat:
+                @"%lu non-voice ranges — %.1fs removable, %.0f ms voice protection",
+                (unsigned long)confirmedCount, removableDuration, voicePadding * 1000.0];
+            if (lastError.length > 0) status = lastError;
+            [self updateStatusUI:status];
+            NSDictionary *result = @{
+                @"status": lastError ? @"error" : @"ok",
+                @"detectedCount": @(detected.count),
+                @"confirmedCount": @(confirmedCount),
+                @"reviewCount": @0,
+                @"removableDuration": @(removableDuration),
+                @"energyThresholdDB": @(energyThresholdDB),
+                @"vadThreshold": @(vadThreshold),
+                @"voicePadding": @(voicePadding),
+                @"minimumEvidence": @(minimumVoiceEvidence),
+                @"sourceCount": @(clipsByPath.count),
+            };
+            if (completion) completion(result);
+        });
+    });
+}
+
 - (void)detectSilences {
     [self.mutableSilences removeAllObjects];
 
@@ -3329,6 +4332,7 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
                     silence.endTime = current.endTime;
                     silence.duration = intraGap;
                     silence.afterWordIndex = i;
+                    silence.inferred = YES;
                     [self.mutableSilences addObject:silence];
                     silenceAdded = YES;
                 }
@@ -3350,6 +4354,7 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
                         silence.endTime = next.startTime;
                         silence.duration = silenceDuration;
                         silence.afterWordIndex = i;
+                        silence.inferred = YES;
                         [self.mutableSilences addObject:silence];
                     }
                 }
@@ -3367,6 +4372,7 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
                 silence.endTime = lastWord.endTime;
                 silence.duration = intraGap;
                 silence.afterWordIndex = self.mutableWords.count - 1;
+                silence.inferred = YES;
                 [self.mutableSilences addObject:silence];
             }
         }
@@ -3949,14 +4955,61 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
         FCPAttrItemType: @"word",
     };
 
-    // Build silence lookup: afterWordIndex -> silence
+    // Audio candidates are always shown as a review list, even when no
+    // transcript exists. Green candidates are selected for removal; yellow
+    // candidates seek for review but remain untouched.
+    NSArray<SpliceKitTranscriptSilence *> *audioCandidates = [self.mutableSilences filteredArrayUsingPredicate:
+        [NSPredicate predicateWithBlock:^BOOL(SpliceKitTranscriptSilence *silence, NSDictionary *bindings) {
+            return silence.audioDetected;
+        }]];
+    if (audioCandidates.count > 0) {
+        NSString *header = [NSString stringWithFormat:@"Audio silence review — %lu candidates\n",
+                            (unsigned long)audioCandidates.count];
+        [attrStr appendAttributedString:[[NSAttributedString alloc] initWithString:header attributes:@{
+            NSFontAttributeName: headerSpeakerFont,
+            NSForegroundColorAttributeName: headerSpeakerColor,
+            FCPAttrItemType: @"header",
+        }]];
+        textPos += header.length;
+        for (SpliceKitTranscriptSilence *silence in audioCandidates) {
+            NSUInteger silenceIndex = [self.mutableSilences indexOfObject:silence];
+            BOOL confirmed = silence.selectedForRemoval && silence.confidence >= 0.9;
+            NSString *line = [NSString stringWithFormat:@"%@  %@ – %@  %.2fs\n",
+                confirmed ? @"● Confirmed" : @"● Review",
+                SpliceKitTranscript_timecodeFromSeconds(silence.startTime, self.frameRate),
+                SpliceKitTranscript_timecodeFromSeconds(silence.endTime, self.frameRate),
+                silence.duration];
+            NSColor *color = confirmed ? [NSColor systemGreenColor] : [NSColor systemYellowColor];
+            silence.textRange = NSMakeRange(textPos, line.length);
+            [attrStr appendAttributedString:[[NSAttributedString alloc] initWithString:line attributes:@{
+                NSFontAttributeName: headerTimeFont,
+                NSForegroundColorAttributeName: color,
+                NSCursorAttributeName: [NSCursor pointingHandCursor],
+                FCPAttrItemType: @"silence",
+                FCPAttrSilenceIndex: @(silenceIndex),
+                NSToolTipAttributeName: [NSString stringWithFormat:
+                    @"%.0f%% detector stability. Click to audition at this point.%@",
+                    silence.confidence * 100.0,
+                    confirmed ? @" Selected for removal." : @" Review only; it will not be removed."],
+            }]];
+            textPos += line.length;
+        }
+        [attrStr appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n" attributes:@{
+            NSFontAttributeName: normalFont, FCPAttrItemType: @"spacer"}]];
+        textPos += 1;
+    }
+
+    // Build transcript-derived silence lookup: audio candidates are already
+    // represented above and must not overwrite each other at a word boundary.
     NSMutableDictionary<NSNumber *, SpliceKitTranscriptSilence *> *silenceMap = [NSMutableDictionary dictionary];
     for (SpliceKitTranscriptSilence *s in self.mutableSilences) {
-        silenceMap[@(s.afterWordIndex)] = s;
+        if (!s.audioDetected) silenceMap[@(s.afterWordIndex)] = s;
     }
 
     @synchronized (self.mutableWords) {
         if (self.mutableWords.count == 0) {
+            [self.textView.textStorage setAttributedString:attrStr];
+            self.fullText = attrStr.string;
             self.suppressTextViewCallbacks = NO;
             return;
         }
@@ -4072,7 +5125,8 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
                             NSBackgroundColorAttributeName: silenceBgColor,
                             FCPAttrItemType: @"silence",
                             FCPAttrSilenceIndex: @([self.mutableSilences indexOfObject:silence]),
-                            NSToolTipAttributeName: [NSString stringWithFormat:@"Pause: %.1fs (%@ - %@)",
+                            NSToolTipAttributeName: [NSString stringWithFormat:@"%@Pause: %.1fs (%@ - %@)",
+                                silence.inferred ? @"Estimated " : @"",
                                 silence.duration,
                                 SpliceKitTranscript_timecodeFromSeconds(silence.startTime, self.frameRate),
                                 SpliceKitTranscript_timecodeFromSeconds(silence.endTime, self.frameRate)],
@@ -4332,38 +5386,49 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
 
     // If only silences selected (no words), delete those silence segments
     if (wordIndices.count == 0 && selectedSilences.count > 0) {
+        NSIndexSet *unconfirmed = [selectedSilences indexesOfObjectsPassingTest:
+            ^BOOL(SpliceKitTranscriptSilence *silence, NSUInteger index, BOOL *stop) {
+                return !silence.audioDetected || !silence.selectedForRemoval || silence.confidence < 0.9;
+            }];
+        if (unconfirmed.count > 0) {
+            [self updateStatusUI:@"Detect timeline audio before deleting selected pauses."];
+            NSBeep();
+            return;
+        }
+        NSString *validationError = [self audioSilencePlanValidationError];
+        if (validationError) {
+            [self updateStatusUI:validationError];
+            NSBeep();
+            return;
+        }
         [self updateStatusUI:@"Deleting pauses..."];
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             // Delete from end to start to avoid position shifts
             NSArray *sorted = [selectedSilences sortedArrayUsingComparator:^NSComparisonResult(SpliceKitTranscriptSilence *a, SpliceKitTranscriptSilence *b) {
                 return (a.startTime > b.startTime) ? NSOrderedAscending : NSOrderedDescending;
             }];
-            double totalRemoved = 0;
+            NSUInteger deletedCount = 0;
+            NSString *lastError = nil;
             for (SpliceKitTranscriptSilence *silence in sorted) {
-                // Adjust for already-removed time
-                double adjStart = silence.startTime - totalRemoved;
-                double adjEnd = silence.endTime - totalRemoved;
-                [self deleteTimelineRange:adjStart end:adjEnd];
-                double removed = silence.duration;
-                totalRemoved += removed;
-
-                // Shift all words after this silence earlier
-                @synchronized (self.mutableWords) {
-                    for (SpliceKitTranscriptWord *word in self.mutableWords) {
-                        if (word.startTime > silence.startTime - (totalRemoved - removed)) {
-                            word.startTime -= removed;
-                        }
-                    }
+                // Descending edits retain every earlier range's original
+                // coordinate. Subtracting cumulative time here caused the
+                // same progressive displacement as the old bulk-delete path.
+                NSDictionary *result = [self deleteTimelineRange:silence.startTime end:silence.endTime];
+                if (result[@"error"]) {
+                    lastError = result[@"error"];
+                    break;
                 }
+                deletedCount++;
             }
 
-            [self detectSilences];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self rebuildTextView];
-                self.deleteSilencesButton.enabled = (self.mutableSilences.count > 0);
-                [self updateStatusUI:[NSString stringWithFormat:@"%lu words, %lu pauses",
-                    (unsigned long)self.mutableWords.count, (unsigned long)self.mutableSilences.count]];
-            });
+            [self scheduleAudioSilenceRedetection];
+            if (lastError) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self updateStatusUI:[NSString stringWithFormat:
+                        @"Deleted %lu selected pauses; stopped: %@",
+                        (unsigned long)deletedCount, lastError]];
+                });
+            }
         });
         return;
     }
@@ -4456,6 +5521,75 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
 // without them, rapid-fire edits can desync the timeline state.
 //
 
+- (NSString *)audioSilencePlanValidationError {
+    __block id activeSequence = nil;
+    __block NSString *currentFingerprint = nil;
+    __block NSString *fingerprintError = nil;
+    SpliceKit_executeOnMainThread(^{
+        id timeline = [self getActiveTimelineModule];
+        activeSequence = [timeline respondsToSelector:@selector(sequence)]
+            ? ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence)) : nil;
+        if (activeSequence) {
+            NSArray *currentPlan = [self audioClipInfosFromFCPXMLWithError:&fingerprintError];
+            if (currentPlan.count > 0) {
+                currentFingerprint = SpliceKitTranscript_audioPlanFingerprint(currentPlan);
+            }
+        }
+    });
+    BOOL fingerprintMatches = self.audioSilenceDetectionTimelineFingerprint.length > 0 &&
+        [currentFingerprint isEqualToString:self.audioSilenceDetectionTimelineFingerprint];
+    if (!activeSequence || !fingerprintMatches) {
+        NSString *reason = fingerprintError.length > 0 ? fingerprintError :
+            @"Timeline changed after audio detection; run Detect Audio again";
+        SpliceKit_log(@"[Transcript] Audio plan validation refused: active=%@ fingerprint=%@ currentLength=%lu detectedLength=%lu reason=%@",
+            activeSequence ? @"yes" : @"no",
+            fingerprintMatches ? @"match" : @"mismatch",
+            (unsigned long)currentFingerprint.length,
+            (unsigned long)self.audioSilenceDetectionTimelineFingerprint.length,
+            reason);
+        return reason;
+    }
+    return nil;
+}
+
+- (double)durationSecondsForSequence:(id)sequence {
+    if (!sequence) return 0.0;
+
+    // FFAnchoredSequence advertises -duration on FCP 11.1, but that selector
+    // returns an invalid/zero CMTime for some synchronized-clip projects.  The
+    // timeline module and its edit commands operate on the primary object's
+    // effective ranges, so derive the duration from that same geometry.  This
+    // also makes the before/after verification independent of cached sequence
+    // metadata that may not have refreshed immediately after a ripple delete.
+    id primary = [sequence respondsToSelector:@selector(primaryObject)]
+        ? ((id (*)(id, SEL))objc_msgSend)(sequence, @selector(primaryObject)) : nil;
+    NSArray *items = [primary respondsToSelector:@selector(containedItems)]
+        ? ((id (*)(id, SEL))objc_msgSend)(primary, @selector(containedItems)) : nil;
+    SEL effectiveRangeSel = NSSelectorFromString(@"effectiveRangeOfObject:");
+    if (![items isKindOfClass:[NSArray class]] ||
+        ![primary respondsToSelector:effectiveRangeSel]) {
+        return 0.0;
+    }
+
+    double timelineEnd = 0.0;
+    for (id item in items) {
+        @try {
+            SpliceKitTranscript_CMTimeRange range =
+                ((SpliceKitTranscript_CMTimeRange (*)(id, SEL, id))STRET_MSG)(
+                    primary, effectiveRangeSel, item);
+            double start = CMTimeToSeconds(range.start);
+            double itemDuration = CMTimeToSeconds(range.duration);
+            if (range.start.timescale > 0 && range.duration.timescale > 0 && itemDuration > 0.0) {
+                timelineEnd = MAX(timelineEnd, start + itemDuration);
+            }
+        } @catch (__unused NSException *e) {
+            // A malformed/auxiliary item must not hide the ranges of valid
+            // primary-storyline items. Continue and use the maximum valid end.
+        }
+    }
+    return timelineEnd;
+}
+
 /// Blade at start, blade at end, select the segment in between, ripple delete it.
 - (NSDictionary *)deleteTimelineRange:(double)deleteStart end:(double)deleteEnd {
     __block NSDictionary *result = nil;
@@ -4466,46 +5600,130 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
                 result = @{@"error": @"No active timeline"};
                 return;
             }
+            id sequence = [timeline respondsToSelector:@selector(sequence)]
+                ? ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence)) : nil;
+            double durationBefore = [self durationSecondsForSequence:sequence];
+            if (durationBefore <= 0.0 || deleteEnd <= deleteStart) {
+                result = @{@"error": @"Unable to verify the timeline duration before deletion"};
+                return;
+            }
+
+            // Complete every structural/selector check before the first blade.
+            // A previous implementation could discover an unsupported range
+            // only after creating one or two edit points, leaving a partially
+            // modified timeline even though the operation reported failure.
+            id primary = [sequence respondsToSelector:@selector(primaryObject)]
+                ? ((id (*)(id, SEL))objc_msgSend)(sequence, @selector(primaryObject)) : nil;
+            NSArray *items = [primary respondsToSelector:@selector(containedItems)]
+                ? ((id (*)(id, SEL))objc_msgSend)(primary, @selector(containedItems)) : nil;
+            SEL effectiveRangeSel = NSSelectorFromString(@"effectiveRangeOfObject:");
+            SEL bladeSel = NSSelectorFromString(@"blade:");
+            SEL setSelectedSel = NSSelectorFromString(@"setSelectedItems:");
+            SEL deleteSel = NSSelectorFromString(@"delete:");
+            if (![items isKindOfClass:[NSArray class]] ||
+                ![primary respondsToSelector:effectiveRangeSel] ||
+                ![timeline respondsToSelector:bladeSel] ||
+                ![timeline respondsToSelector:setSelectedSel] ||
+                ![timeline respondsToSelector:deleteSel]) {
+                result = @{@"error": @"Timeline does not support exact range deletion"};
+                return;
+            }
+            double frameTolerance = 0.5 / MAX(self.frameRate, 1.0);
+            BOOL rangeInsideOneItem = NO;
+            for (id item in items) {
+                SpliceKitTranscript_CMTimeRange itemRange =
+                    ((SpliceKitTranscript_CMTimeRange (*)(id, SEL, id))STRET_MSG)(
+                        primary, effectiveRangeSel, item);
+                double itemStart = CMTimeToSeconds(itemRange.start);
+                double itemEnd = itemStart + CMTimeToSeconds(itemRange.duration);
+                if (deleteStart >= itemStart - frameTolerance &&
+                    deleteEnd <= itemEnd + frameTolerance) {
+                    rangeInsideOneItem = YES;
+                    break;
+                }
+            }
+            if (!rangeInsideOneItem) {
+                result = @{@"error": @"Requested deletion crosses a primary timeline item boundary"};
+                return;
+            }
 
             // Blade at start
             [self setPlayheadToTime:deleteStart];
             [NSThread sleepForTimeInterval:0.02];
 
-            SEL bladeSel = NSSelectorFromString(@"blade:");
-            if ([timeline respondsToSelector:bladeSel]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(timeline, bladeSel, nil);
-            }
+            ((void (*)(id, SEL, id))objc_msgSend)(timeline, bladeSel, nil);
             [NSThread sleepForTimeInterval:0.02];
 
             // Blade at end
             [self setPlayheadToTime:deleteEnd];
             [NSThread sleepForTimeInterval:0.02];
 
-            if ([timeline respondsToSelector:bladeSel]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(timeline, bladeSel, nil);
-            }
+            ((void (*)(id, SEL, id))objc_msgSend)(timeline, bladeSel, nil);
             [NSThread sleepForTimeInterval:0.02];
 
-            // Select clip at midpoint
-            double midPoint = (deleteStart + deleteEnd) / 2.0;
-            [self setPlayheadToTime:midPoint];
-            [NSThread sleepForTimeInterval:0.02];
-
-            SEL selectSel = NSSelectorFromString(@"selectClipAtPlayhead:");
-            if ([timeline respondsToSelector:selectSel]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(timeline, selectSel, nil);
+            // Select the freshly bladed range by object bounds.  Midpoint-only
+            // selection is ambiguous for a one-frame range because FCP can
+            // quantize the playhead onto either adjacent edit point. Require
+            // exact object selection; deleting an adjacent equal-duration item
+            // could otherwise pass duration verification while removing voice.
+            id exactItem = nil;
+            items = [primary respondsToSelector:@selector(containedItems)]
+                ? ((id (*)(id, SEL))objc_msgSend)(primary, @selector(containedItems)) : nil;
+            if ([items isKindOfClass:[NSArray class]] &&
+                [primary respondsToSelector:effectiveRangeSel]) {
+                for (id item in items) {
+                    SpliceKitTranscript_CMTimeRange itemRange =
+                        ((SpliceKitTranscript_CMTimeRange (*)(id, SEL, id))STRET_MSG)(
+                            primary, effectiveRangeSel, item);
+                    double itemStart = CMTimeToSeconds(itemRange.start);
+                    double itemEnd = itemStart + CMTimeToSeconds(itemRange.duration);
+                    if (fabs(itemStart - deleteStart) <= frameTolerance &&
+                        fabs(itemEnd - deleteEnd) <= frameTolerance) {
+                        exactItem = item;
+                        break;
+                    }
+                }
             }
+
+            if (!exactItem) {
+                result = @{@"error": @"Unable to select the exact bladed timeline range"};
+                return;
+            }
+            ((void (*)(id, SEL, id))objc_msgSend)(timeline, setSelectedSel, @[exactItem]);
             [NSThread sleepForTimeInterval:0.02];
 
             // Delete (ripple delete)
-            SEL deleteSel = NSSelectorFromString(@"delete:");
-            if ([timeline respondsToSelector:deleteSel]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(timeline, deleteSel, nil);
+            ((void (*)(id, SEL, id))objc_msgSend)(timeline, deleteSel, nil);
+            [NSThread sleepForTimeInterval:0.02];
+
+            double durationAfter = [self durationSecondsForSequence:sequence];
+            double expectedRemoved = deleteEnd - deleteStart;
+            double actualRemoved = durationBefore - durationAfter;
+            double frameDuration = 1.0 / MAX(self.frameRate, 1.0);
+            NSArray *itemsAfter = [primary respondsToSelector:@selector(containedItems)]
+                ? ((id (*)(id, SEL))objc_msgSend)(primary, @selector(containedItems)) : nil;
+            BOOL targetRemoved = [itemsAfter isKindOfClass:[NSArray class]] &&
+                [(NSArray *)itemsAfter indexOfObjectIdenticalTo:exactItem] == NSNotFound;
+            BOOL removedMedia = actualRemoved > frameDuration * 0.5;
+            BOOL durationMatches = fabs(actualRemoved - expectedRemoved) <= frameDuration * 1.1;
+            if (!targetRemoved || !removedMedia || !durationMatches) {
+                result = @{
+                    @"error": @"Timeline deletion did not remove the requested duration",
+                    @"targetRemoved": @(targetRemoved),
+                    @"expectedRemoved": @(expectedRemoved),
+                    @"actualRemoved": @(actualRemoved),
+                    @"durationBefore": @(durationBefore),
+                    @"durationAfter": @(durationAfter),
+                };
+                return;
             }
 
-            result = @{@"status": @"ok",
-                       @"timeRange": @{@"start": @(deleteStart), @"end": @(deleteEnd)},
-                       @"duration": @(deleteEnd - deleteStart)};
+            result = @{
+                @"status": @"ok",
+                @"timeRange": @{@"start": @(deleteStart), @"end": @(deleteEnd)},
+                @"duration": @(actualRemoved),
+                @"verified": @YES,
+            };
 
         } @catch (NSException *e) {
             result = @{@"error": [NSString stringWithFormat:@"Exception: %@", e.reason]};
@@ -4568,31 +5786,74 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
 
 #pragma mark - Delete Silences (Batch)
 // Removes silence gaps from the timeline. Works from end to start so each
-// removal's time shift doesn't affect the positions of not-yet-deleted silences.
-// After all timeline edits, we walk forward through the word array and shift
-// timestamps by the cumulative duration of removed silences before each word.
+// later removal cannot affect the original coordinates of an earlier silence.
+// After all timeline edits, FFmpeg re-analyzes the edited audio so the panel
+// cannot offer stale pre-edit pause markers for a second destructive pass.
 
 - (NSDictionary *)deleteAllSilences {
-    return [self deleteSilencesLongerThan:0];
+    return [self deleteSilencesLongerThan:0
+                          boundaryPadding:0.0
+                          includeInferred:NO];
 }
 
 - (NSDictionary *)deleteSilencesLongerThan:(double)minDuration {
-    [self ensurePersistedStateLoaded];
+    return [self deleteSilencesLongerThan:minDuration
+                          boundaryPadding:0.0
+                          includeInferred:NO];
+}
 
-    // Collect silences to delete (filter by minimum duration)
+- (NSDictionary *)deleteSilencesLongerThan:(double)minDuration
+                           boundaryPadding:(double)boundaryPadding
+                           includeInferred:(BOOL)includeInferred {
+    [self ensurePersistedStateLoaded];
+    boundaryPadding = MAX(0.0, boundaryPadding);
+
+    // Persisted or asynchronously produced ranges must never be applied to a
+    // different sequence or to any timeline structure changed after the mask
+    // was measured.
+    NSString *validationError = [self audioSilencePlanValidationError];
+    if (validationError) return @{ @"error": validationError };
+
+    // Collect explicit inter-word gaps by default.  Long-word and
+    // start-to-start heuristics are useful for showing possible pauses, but
+    // are not safe destructive-edit boundaries without audio/VAD confirmation.
     NSMutableArray<SpliceKitTranscriptSilence *> *toDelete = [NSMutableArray array];
+    NSUInteger skippedInferred = 0;
+    NSUInteger skippedUnconfirmed = 0;
+    NSUInteger skippedForPadding = 0;
     for (SpliceKitTranscriptSilence *silence in self.mutableSilences) {
-        if (silence.duration >= minDuration) {
-            [toDelete addObject:silence];
+        if (silence.duration < minDuration) continue;
+        if (!silence.audioDetected || !silence.selectedForRemoval || silence.confidence < 0.9) {
+            skippedUnconfirmed++;
+            continue;
         }
+        if (silence.inferred && !includeInferred) {
+            skippedInferred++;
+            continue;
+        }
+        if (silence.duration <= boundaryPadding * 2.0) {
+            skippedForPadding++;
+            continue;
+        }
+        [toDelete addObject:silence];
     }
 
     if (toDelete.count == 0) {
-        return @{@"status": @"ok", @"deletedCount": @0, @"message": @"No silences to delete"};
+        return @{
+            @"status": @"ok",
+            @"deletedCount": @0,
+            @"skippedInferred": @(skippedInferred),
+            @"skippedUnconfirmed": @(skippedUnconfirmed),
+            @"skippedForPadding": @(skippedForPadding),
+            @"boundaryPadding": @(boundaryPadding),
+            @"message": @"No confirmed audio silences found. Run Detect Audio first.",
+        };
     }
 
-    SpliceKit_log(@"[Transcript] Batch deleting %lu silences (min duration: %.2fs)",
-                  (unsigned long)toDelete.count, minDuration);
+    SpliceKit_log(@"[Transcript] Batch deleting %lu explicit silences "
+                  @"(min duration: %.2fs, padding: %.2fs/side, inferred: %@)",
+                  (unsigned long)toDelete.count, minDuration, boundaryPadding,
+                  includeInferred ? @"included" : @"skipped");
 
     dispatch_async(dispatch_get_main_queue(), ^{
         [self updateStatusUI:[NSString stringWithFormat:@"Deleting %lu pauses...", (unsigned long)toDelete.count]];
@@ -4601,7 +5862,10 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
         self.deleteSilencesButton.enabled = NO;
     });
 
-    // Sort by startTime descending (delete from end first to avoid position shifts)
+    // Sort by startTime descending.  Deleting a later range does not change
+    // the coordinates of any earlier range, so every cut below deliberately
+    // uses its original timeline coordinates.  Subtracting a cumulative
+    // offset here was the source of progressively misplaced cuts.
     [toDelete sortUsingComparator:^NSComparisonResult(SpliceKitTranscriptSilence *a, SpliceKitTranscriptSilence *b) {
         return (a.startTime > b.startTime) ? NSOrderedAscending : NSOrderedDescending;
     }];
@@ -4614,17 +5878,19 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     // Sleeps are reduced from 50ms to 20ms since these are direct ObjC calls
     // that execute synchronously — the sleep is just for FCP's internal state to settle.
     for (SpliceKitTranscriptSilence *silence in toDelete) {
-        // Adjust times for already-removed content
-        double adjStart = silence.startTime - totalTimeRemoved;
-        double adjEnd = silence.endTime - totalTimeRemoved;
+        // Keep speech handles on both sides because ASR word boundaries are
+        // estimates and often land inside leading/trailing consonants.
+        double cutStart = silence.startTime + boundaryPadding;
+        double cutEnd = silence.endTime - boundaryPadding;
 
-        NSDictionary *result = [self deleteTimelineRange:adjStart end:adjEnd];
+        NSDictionary *result = [self deleteTimelineRange:cutStart end:cutEnd];
         if (result[@"error"]) {
             lastError = result[@"error"];
-            SpliceKit_log(@"[Transcript] Error deleting silence at %.2fs: %@", adjStart, lastError);
+            SpliceKit_log(@"[Transcript] Error deleting silence at %.2fs: %@", cutStart, lastError);
+            break;
         } else {
             deletedCount++;
-            totalTimeRemoved += silence.duration;
+            totalTimeRemoved += [result[@"duration"] doubleValue];
         }
 
         if (deletedCount % 5 == 0) {
@@ -4635,25 +5901,21 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
         }
     }
 
-    // Re-read the actual clip layout after the ripple deletes instead of trying
-    // to infer every timestamp shift locally. This keeps clipTimelineStart and
-    // sourceMediaOffset consistent with the real timeline state.
-    [self resyncTimestampsFromTimeline];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self rebuildTextView];
-        self.spinner.hidden = YES;
-        [self.spinner stopAnimation:nil];
-        self.deleteSilencesButton.enabled = (self.mutableSilences.count > 0);
-        [self updateStatusUI:[NSString stringWithFormat:@"%lu words, %lu pauses — removed %lu silences",
-            (unsigned long)self.mutableWords.count, (unsigned long)self.mutableSilences.count,
-            (unsigned long)deletedCount]];
-    });
+    // Verify the edited timeline from its audio. Do not invoke Parakeet (or
+    // any transcription service) for silence removal or post-cut validation.
+    [self scheduleAudioSilenceRedetection];
 
     NSMutableDictionary *response = [NSMutableDictionary dictionary];
     response[@"status"] = lastError ? @"partial" : @"ok";
     response[@"deletedCount"] = @(deletedCount);
     response[@"totalSilences"] = @(toDelete.count);
     response[@"timeRemoved"] = @(totalTimeRemoved);
+    response[@"boundaryPadding"] = @(boundaryPadding);
+    response[@"skippedInferred"] = @(skippedInferred);
+    response[@"skippedUnconfirmed"] = @(skippedUnconfirmed);
+    response[@"skippedForPadding"] = @(skippedForPadding);
+    response[@"includedInferred"] = @(includeInferred);
+    response[@"audioVerificationScheduled"] = @YES;
     if (lastError) response[@"lastError"] = lastError;
 
     return response;
@@ -4804,8 +6066,22 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     });
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [self performTimelineTranscription];
+                   dispatch_get_main_queue(), ^{
+        [self transcribeTimeline];
+    });
+}
+
+- (void)scheduleAudioSilenceRedetection {
+    SpliceKit_log(@"[Transcript] Scheduling FFmpeg verification after silence edits...");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self.mutableSilences removeAllObjects];
+        self.deleteSilencesButton.enabled = NO;
+        self.deleteSilencesButton.title = @"Remove Confirmed";
+        [self updateStatusUI:@"Verifying edited timeline audio..."];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self detectAudioSilencesWithCompletion:nil];
     });
 }
 
@@ -5136,6 +6412,15 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     state[@"wordCount"] = @(self.mutableWords.count);
     state[@"silenceCount"] = @(self.mutableSilences.count);
     state[@"silenceThreshold"] = @(self.silenceThreshold);
+    state[@"audioSilenceDetectionRunning"] = @(self.audioSilenceDetectionRunning);
+    state[@"audioSilenceSettings"] = @{
+        @"noiseThresholdDB": @(self.audioSilenceNoiseDB),
+        @"confirmationThresholdDB": @(self.audioSilenceConfirmDB),
+        @"mergeGap": @(self.audioSilenceMergeGap),
+        @"roomTone": @(self.audioSilenceRoomTone),
+        @"voiceEdgeProtection": @(self.audioVoicePadding),
+        @"voiceEdgeProtectionFrames": @(self.audioVoicePadding * MAX(self.frameRate, 1.0)),
+    };
     state[@"frameRate"] = @(self.frameRate);
     state[@"engine"] = (self.engine == SpliceKitTranscriptEngineFCPNative) ? @"fcpNative" :
                        (self.engine == SpliceKitTranscriptEngineParakeet) ? @"parakeet" : @"appleSpeech";
@@ -5186,6 +6471,10 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
                 @"endTime": @(silence.endTime),
                 @"duration": @(silence.duration),
                 @"afterWordIndex": @(silence.afterWordIndex),
+                @"inferred": @(silence.inferred),
+                @"audioDetected": @(silence.audioDetected),
+                @"confidence": @(silence.confidence),
+                @"selectedForRemoval": @(silence.selectedForRemoval),
                 @"startTimecode": SpliceKitTranscript_timecodeFromSeconds(silence.startTime, self.frameRate),
                 @"endTimecode": SpliceKitTranscript_timecodeFromSeconds(silence.endTime, self.frameRate),
             }];

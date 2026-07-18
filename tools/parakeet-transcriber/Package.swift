@@ -5,6 +5,10 @@ import PackageDescription
 let package = Package(
     name: "parakeet-transcriber",
     platforms: [.macOS(.v14)],
+    products: [
+        .executable(name: "parakeet-transcriber", targets: ["parakeet-transcriber"]),
+        .executable(name: "voice-activity-detector", targets: ["voice-activity-detector"]),
+    ],
     dependencies: [
         .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.12.0"),
     ],
@@ -15,6 +19,13 @@ let package = Package(
                 .product(name: "FluidAudio", package: "FluidAudio"),
             ],
             path: "Sources"
+        ),
+        .executableTarget(
+            name: "voice-activity-detector",
+            dependencies: [
+                .product(name: "FluidAudio", package: "FluidAudio"),
+            ],
+            path: "VADSources"
         ),
     ]
 )

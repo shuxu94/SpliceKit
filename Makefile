@@ -68,6 +68,7 @@ WHISPER_DEBUG_BIN = $(WHISPER_PKG_DIR)/.build/debug/whisper-transcriber
 # checkout rebuilds + redeploys the transcribers without any manual swift build.
 PARAKEET_SRC_DIR = tools/parakeet-transcriber
 PARAKEET_LOCAL_BIN = $(PARAKEET_SRC_DIR)/.build/release/parakeet-transcriber
+VOICE_ACTIVITY_DETECTOR_LOCAL_BIN = $(PARAKEET_SRC_DIR)/.build/release/voice-activity-detector
 WHISPER_SRC_DIR = tools/whisper-transcriber
 WHISPER_LOCAL_BIN = $(WHISPER_SRC_DIR)/.build/release/whisper-transcriber
 
@@ -132,7 +133,27 @@ MKV_FRAMEWORKS = -framework Foundation -framework CoreFoundation -framework Core
 MKV_CFLAGS = $(ARCHS) $(MIN_VERSION) -fno-objc-arc -fmodules -fmodules-cache-path=$(abspath $(MODULE_CACHE_DIR)) -std=c++17 $(DEBUG_FLAGS) -fvisibility=hidden -Wno-deprecated-declarations -I $(MKV_SOURCE_DIR) -I $(MKV_PRIVATE_DIR) -I $(MKV_LIBWEBM_DIR)
 MKV_LDFLAGS = -bundle $(CPP_LIBS)
 
-.PHONY: all clean deploy deploy-one launch tools url-import-tools audio-bus-probe install-audio-bus-probe uninstall-audio-bus-probe symbols braw-prototype braw-raw-processor vp9-prototype mkv-prototype mcp-setup mcp-doctor
+.PHONY: all clean deploy deploy-one deploy-accuracy-fix launch tools url-import-tools audio-bus-probe install-audio-bus-probe uninstall-audio-bus-probe symbols braw-prototype braw-raw-processor vp9-prototype mkv-prototype mcp-setup mcp-doctor
+
+# Never rewrite or re-sign code that a running FCP process has mapped. Doing so
+# changes pages behind the kernel's code-signing cache and the process is killed
+# with CODESIGNING/Invalid Page the next time one of those pages is faulted in.
+define REQUIRE_MODDED_APP_STOPPED
+framework_binary="$(FW_DIR)/Versions/A/SpliceKit"; \
+app_executable_name=$$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$(MODDED_APP)/Contents/Info.plist" 2>/dev/null || true); \
+app_binary=""; \
+if [ -n "$$app_executable_name" ]; then app_binary="$(MODDED_APP)/Contents/MacOS/$$app_executable_name"; fi; \
+open_pids=$$(/usr/sbin/lsof -t "$$framework_binary" 2>/dev/null || true); \
+if [ -n "$$app_binary" ] && [ -e "$$app_binary" ]; then \
+	app_pids=$$(/usr/sbin/lsof -t "$$app_binary" 2>/dev/null || true); \
+	if [ -n "$$app_pids" ]; then open_pids="$${open_pids}$${open_pids:+ }$$app_pids"; fi; \
+fi; \
+if [ -n "$$open_pids" ]; then \
+	echo "ERROR: Refusing to deploy while $(MODDED_APP) is running (PID(s): $$open_pids)."; \
+	echo "Quit Final Cut Pro completely, then run this target again."; \
+	exit 1; \
+fi
+endef
 
 all: $(OUTPUT)
 
@@ -405,7 +426,7 @@ braw-raw-processor: $(BRAW_RAWPROC_EXEC)
 # always redeploys current binaries. swift build is incremental, so these are
 # cheap no-ops when nothing changed. They fail hard rather than deploy a stale
 # binary (a stale transcriber caused subtle "didn't update" bugs before).
-.PHONY: whisper-transcriber parakeet-transcriber
+.PHONY: whisper-transcriber parakeet-transcriber voice-activity-detector
 whisper-transcriber:
 	@if [ -d "$(WHISPER_SRC_DIR)" ]; then \
 		echo "=== Building whisper-transcriber ($(WHISPER_SRC_DIR)) ==="; \
@@ -427,6 +448,41 @@ parakeet-transcriber:
 			exit 1; \
 		fi; \
 	else echo "  Skipped: $(PARAKEET_SRC_DIR) not found"; fi
+
+# The silence-removal UI uses a dedicated Silero VAD helper from the same
+# FluidAudio package. It performs voice activity detection only; it does not
+# invoke Parakeet or any transcription service.
+voice-activity-detector: parakeet-transcriber
+	@test -x "$(VOICE_ACTIVITY_DETECTOR_LOCAL_BIN)" || \
+		( echo "ERROR: voice-activity-detector was not produced"; exit 1 )
+
+# Narrow deployment for the transcript silence-accuracy path. This updates only
+# the injected framework binary and its dedicated VAD helper, leaving codecs,
+# format readers, transcribers, and other modded FCP components untouched.
+deploy-accuracy-fix: $(OUTPUT) voice-activity-detector
+	@test -d "$(FW_DIR)" || ( echo "Missing SpliceKit framework: $(FW_DIR)"; exit 1 )
+	@$(REQUIRE_MODDED_APP_STOPPED)
+	@set -e; \
+		framework_binary="$(FW_DIR)/Versions/A/SpliceKit"; \
+		framework_helper="$(FW_DIR)/Versions/A/Resources/voice-activity-detector"; \
+		tools_helper="$(TOOLS_DIR)/voice-activity-detector"; \
+		mkdir -p "$(FW_DIR)/Versions/A/Resources" "$(TOOLS_DIR)"; \
+		framework_stage=$$(mktemp "$$framework_binary.new.XXXXXX"); \
+		framework_helper_stage=$$(mktemp "$$framework_helper.new.XXXXXX"); \
+		tools_helper_stage=$$(mktemp "$$tools_helper.new.XXXXXX"); \
+		trap 'rm -f "$$framework_stage" "$$framework_helper_stage" "$$tools_helper_stage"' EXIT HUP INT TERM; \
+		install -m 755 "$(OUTPUT)" "$$framework_stage"; \
+		install -m 755 "$(VOICE_ACTIVITY_DETECTOR_LOCAL_BIN)" "$$framework_helper_stage"; \
+		install -m 755 "$(VOICE_ACTIVITY_DETECTOR_LOCAL_BIN)" "$$tools_helper_stage"; \
+		codesign --force --sign - "$$tools_helper_stage"; \
+		mv -f "$$framework_stage" "$$framework_binary"; \
+		mv -f "$$framework_helper_stage" "$$framework_helper"; \
+		mv -f "$$tools_helper_stage" "$$tools_helper"; \
+		trap - EXIT HUP INT TERM
+	@codesign --force --options runtime --sign - "$(FW_DIR)"
+	@codesign --force --options runtime --sign - --entitlements "$(ENTITLEMENTS)" "$(MODDED_APP)"
+	@codesign --verify --strict --verbose=2 "$(FW_DIR)"
+	@echo "Deployed silence-accuracy fix to: $(MODDED_APP)"
 
 # Deploy the dylib into EVERY modded FCP edition found (standard, Creator Studio,
 # Trial). Build the shared artifacts once via prerequisites, then fan out to a
@@ -453,8 +509,9 @@ endif
 
 # Deploy into a single app bundle ($(MODDED_APP)). Internal helper for `deploy`;
 # depends on $(OUTPUT) so direct invocation still has a built dylib to copy.
-deploy-one: $(OUTPUT)
+deploy-one: $(OUTPUT) voice-activity-detector
 	@echo "=== Deploying SpliceKit to modded FCP ==="
+	@$(REQUIRE_MODDED_APP_STOPPED)
 		@rm -rf "$(FW_DIR)"
 		@mkdir -p "$(FW_DIR)/Versions/A/Resources"
 	cp $(OUTPUT) "$(FW_DIR)/Versions/A/SpliceKit"
@@ -499,6 +556,9 @@ deploy-one: $(OUTPUT)
 		cp "$(PARAKEET_DEBUG_BIN)" "$(TOOLS_DIR)/parakeet-transcriber"; \
 		cp "$(PARAKEET_DEBUG_BIN)" "$(FW_DIR)/Versions/A/Resources/parakeet-transcriber"; \
 	fi
+	@cp "$(VOICE_ACTIVITY_DETECTOR_LOCAL_BIN)" "$(TOOLS_DIR)/voice-activity-detector"
+	@cp "$(VOICE_ACTIVITY_DETECTOR_LOCAL_BIN)" "$(FW_DIR)/Versions/A/Resources/voice-activity-detector"
+	@echo "Deployed voice-activity-detector (Silero VAD; no transcription)"
 	@# whisper: prefer the freshly-built local tools binary; fall back to patcher.
 	@if [ -f "$(WHISPER_LOCAL_BIN)" ]; then \
 		cp "$(WHISPER_LOCAL_BIN)" "$(TOOLS_DIR)/whisper-transcriber"; \

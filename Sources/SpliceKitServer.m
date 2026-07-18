@@ -6829,10 +6829,27 @@ static NSDictionary *SpliceKit_handleTranscriptSearch(NSDictionary *params) {
 
 static NSDictionary *SpliceKit_handleTranscriptDeleteSilences(NSDictionary *params) {
     double minDuration = [params[@"minDuration"] doubleValue]; // 0 = delete all
+    double boundaryPadding = params[@"boundaryPadding"]
+        ? MAX(0.0, [params[@"boundaryPadding"] doubleValue]) : 0.175;
+    BOOL includeInferred = [params[@"includeInferred"] boolValue];
 
     __block NSDictionary *result = nil;
-    result = [[SpliceKitTranscriptPanel sharedPanel] deleteSilencesLongerThan:minDuration];
+    result = [[SpliceKitTranscriptPanel sharedPanel]
+        deleteSilencesLongerThan:minDuration
+        boundaryPadding:boundaryPadding
+        includeInferred:includeInferred];
     return result ?: @{@"error": @"Operation failed"};
+}
+
+static NSDictionary *SpliceKit_handleTranscriptDetectAudioSilences(NSDictionary *params) {
+    SpliceKitTranscriptPanel *panel = [SpliceKitTranscriptPanel sharedPanel];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [panel detectAudioSilencesWithCompletion:nil];
+    });
+    return @{
+        @"status": @"started",
+        @"message": @"FFmpeg timeline-audio analysis started. Use transcript.getState for confirmed and review candidates.",
+    };
 }
 
 static NSDictionary *SpliceKit_handleTranscriptSetSilenceThreshold(NSDictionary *params) {
@@ -27799,6 +27816,8 @@ NSDictionary *SpliceKit_handleRequest(NSDictionary *request) {
         result = SpliceKit_handleTranscriptSearch(params);
     } else if ([method isEqualToString:@"transcript.deleteSilences"]) {
         result = SpliceKit_handleTranscriptDeleteSilences(params);
+    } else if ([method isEqualToString:@"transcript.detectAudioSilences"]) {
+        result = SpliceKit_handleTranscriptDetectAudioSilences(params);
     } else if ([method isEqualToString:@"transcript.clear"]) {
         SpliceKit_executeOnMainThread(^{
             [[SpliceKitTranscriptPanel sharedPanel] clearTranscript];
