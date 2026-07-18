@@ -133,7 +133,7 @@ MKV_FRAMEWORKS = -framework Foundation -framework CoreFoundation -framework Core
 MKV_CFLAGS = $(ARCHS) $(MIN_VERSION) -fno-objc-arc -fmodules -fmodules-cache-path=$(abspath $(MODULE_CACHE_DIR)) -std=c++17 $(DEBUG_FLAGS) -fvisibility=hidden -Wno-deprecated-declarations -I $(MKV_SOURCE_DIR) -I $(MKV_PRIVATE_DIR) -I $(MKV_LIBWEBM_DIR)
 MKV_LDFLAGS = -bundle $(CPP_LIBS)
 
-.PHONY: all clean deploy deploy-one deploy-accuracy-fix launch tools url-import-tools audio-bus-probe install-audio-bus-probe uninstall-audio-bus-probe symbols braw-prototype braw-raw-processor vp9-prototype mkv-prototype mcp-setup mcp-doctor
+.PHONY: all clean deploy deploy-one launch tools url-import-tools audio-bus-probe install-audio-bus-probe uninstall-audio-bus-probe symbols braw-prototype braw-raw-processor vp9-prototype mkv-prototype mcp-setup mcp-doctor
 
 # Never rewrite or re-sign code that a running FCP process has mapped. Doing so
 # changes pages behind the kernel's code-signing cache and the process is killed
@@ -455,34 +455,6 @@ parakeet-transcriber:
 voice-activity-detector: parakeet-transcriber
 	@test -x "$(VOICE_ACTIVITY_DETECTOR_LOCAL_BIN)" || \
 		( echo "ERROR: voice-activity-detector was not produced"; exit 1 )
-
-# Narrow deployment for the transcript silence-accuracy path. This updates only
-# the injected framework binary and its dedicated VAD helper, leaving codecs,
-# format readers, transcribers, and other modded FCP components untouched.
-deploy-accuracy-fix: $(OUTPUT) voice-activity-detector
-	@test -d "$(FW_DIR)" || ( echo "Missing SpliceKit framework: $(FW_DIR)"; exit 1 )
-	@$(REQUIRE_MODDED_APP_STOPPED)
-	@set -e; \
-		framework_binary="$(FW_DIR)/Versions/A/SpliceKit"; \
-		framework_helper="$(FW_DIR)/Versions/A/Resources/voice-activity-detector"; \
-		tools_helper="$(TOOLS_DIR)/voice-activity-detector"; \
-		mkdir -p "$(FW_DIR)/Versions/A/Resources" "$(TOOLS_DIR)"; \
-		framework_stage=$$(mktemp "$$framework_binary.new.XXXXXX"); \
-		framework_helper_stage=$$(mktemp "$$framework_helper.new.XXXXXX"); \
-		tools_helper_stage=$$(mktemp "$$tools_helper.new.XXXXXX"); \
-		trap 'rm -f "$$framework_stage" "$$framework_helper_stage" "$$tools_helper_stage"' EXIT HUP INT TERM; \
-		install -m 755 "$(OUTPUT)" "$$framework_stage"; \
-		install -m 755 "$(VOICE_ACTIVITY_DETECTOR_LOCAL_BIN)" "$$framework_helper_stage"; \
-		install -m 755 "$(VOICE_ACTIVITY_DETECTOR_LOCAL_BIN)" "$$tools_helper_stage"; \
-		codesign --force --sign - "$$tools_helper_stage"; \
-		mv -f "$$framework_stage" "$$framework_binary"; \
-		mv -f "$$framework_helper_stage" "$$framework_helper"; \
-		mv -f "$$tools_helper_stage" "$$tools_helper"; \
-		trap - EXIT HUP INT TERM
-	@codesign --force --options runtime --sign - "$(FW_DIR)"
-	@codesign --force --options runtime --sign - --entitlements "$(ENTITLEMENTS)" "$(MODDED_APP)"
-	@codesign --verify --strict --verbose=2 "$(FW_DIR)"
-	@echo "Deployed silence-accuracy fix to: $(MODDED_APP)"
 
 # Deploy the dylib into EVERY modded FCP edition found (standard, Creator Studio,
 # Trial). Build the shared artifacts once via prerequisites, then fan out to a

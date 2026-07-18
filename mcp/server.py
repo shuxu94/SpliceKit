@@ -2829,8 +2829,6 @@ def search_transcript(query: str) -> str:
 @mcp.tool(annotations=_tool_annotations("delete_transcript_silences"))
 def delete_transcript_silences(
     min_duration: float = 0.0,
-    boundary_padding: float = 0.175,
-    include_inferred: bool = False,
 ) -> str:
     """Delete high-confidence FFmpeg-confirmed silences from the timeline.
 
@@ -2840,27 +2838,14 @@ def delete_transcript_silences(
     Args:
         min_duration: Minimum silence duration in seconds to delete. Default 0 = all safe silences.
                       Use 0.8 to only delete pauses at least eight-tenths of a second long.
-        boundary_padding: Room-tone handle preserved on each side of a deleted pause.
-                          Default 0.175 seconds (0.35 seconds total).
-        include_inferred: Compatibility option. Transcript-inferred pauses are never
-                          removed unless first confirmed by FFmpeg audio analysis.
-
     Use timeline_action("undo") repeatedly to reverse.
     """
-    r = bridge.call(
-        "transcript.deleteSilences",
-        minDuration=min_duration,
-        boundaryPadding=boundary_padding,
-        includeInferred=include_inferred,
-    )
+    r = bridge.call("transcript.deleteSilences", minDuration=min_duration)
     if _err(r):
         return f"Error: {r.get('error', r)}"
 
     lines = [f"Status: {r.get('status', 'unknown')}"]
     lines.append(f"Deleted: {r.get('deletedCount', 0)}/{r.get('totalSilences', 0)} silences")
-    lines.append(f"Boundary padding: {r.get('boundaryPadding', boundary_padding):.2f}s per side")
-    if r.get("skippedInferred", 0):
-        lines.append(f"Skipped inferred pauses: {r['skippedInferred']}")
     if r.get("lastError"):
         lines.append(f"Last error: {r['lastError']}")
 

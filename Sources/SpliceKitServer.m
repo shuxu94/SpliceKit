@@ -6829,15 +6829,9 @@ static NSDictionary *SpliceKit_handleTranscriptSearch(NSDictionary *params) {
 
 static NSDictionary *SpliceKit_handleTranscriptDeleteSilences(NSDictionary *params) {
     double minDuration = [params[@"minDuration"] doubleValue]; // 0 = delete all
-    double boundaryPadding = params[@"boundaryPadding"]
-        ? MAX(0.0, [params[@"boundaryPadding"] doubleValue]) : 0.175;
-    BOOL includeInferred = [params[@"includeInferred"] boolValue];
 
     __block NSDictionary *result = nil;
-    result = [[SpliceKitTranscriptPanel sharedPanel]
-        deleteSilencesLongerThan:minDuration
-        boundaryPadding:boundaryPadding
-        includeInferred:includeInferred];
+    result = [[SpliceKitTranscriptPanel sharedPanel] deleteSilencesLongerThan:minDuration];
     return result ?: @{@"error": @"Operation failed"};
 }
 

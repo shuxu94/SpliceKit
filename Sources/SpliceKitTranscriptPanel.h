@@ -97,9 +97,6 @@ typedef NS_ENUM(NSInteger, SpliceKitTranscriptEngine) {
 - (void)detectAudioSilencesWithCompletion:(void (^)(NSDictionary *result))completion;
 - (NSDictionary *)deleteAllSilences;
 - (NSDictionary *)deleteSilencesLongerThan:(double)minDuration;
-- (NSDictionary *)deleteSilencesLongerThan:(double)minDuration
-                           boundaryPadding:(double)boundaryPadding
-                           includeInferred:(BOOL)includeInferred;
 
 // Speaker assignment
 - (void)setSpeaker:(NSString *)speaker forWordsFrom:(NSUInteger)startIndex count:(NSUInteger)count;

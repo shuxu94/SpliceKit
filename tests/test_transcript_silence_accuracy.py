@@ -36,9 +36,7 @@ class TranscriptSilenceAccuracyTests(unittest.TestCase):
         cls.server = source(SERVER)
         cls.batch_delete = method_body(
             cls.panel,
-            "- (NSDictionary *)deleteSilencesLongerThan:(double)minDuration\n"
-            "                           boundaryPadding:(double)boundaryPadding\n"
-            "                           includeInferred:(BOOL)includeInferred",
+            "- (NSDictionary *)deleteSilencesLongerThan:(double)minDuration",
         )
 
     def test_audio_first_mode_uses_one_frame_minimum_and_safe_voice_edges(self):
@@ -55,11 +53,14 @@ class TranscriptSilenceAccuracyTests(unittest.TestCase):
         )
         self.assertIn("self.audioVoicePadding = voicePadding", detector)
         self.assertNotIn("self.audioVoicePadding = 0.0", detector)
-        delete_all = method_body(self.panel, "- (NSDictionary *)deleteAllSilences")
         # The protection is already part of the detected voice mask. The delete
         # path must apply those exact confirmed ranges without adding another,
         # unrelated silence-side buffer.
-        self.assertIn("boundaryPadding:0.0", delete_all)
+        self.assertIn(
+            "deleteTimelineRange:silence.startTime end:silence.endTime",
+            self.batch_delete,
+        )
+        self.assertNotIn("boundaryPadding", self.header)
 
     def test_ui_and_rpc_report_voice_edge_protection(self):
         preset = method_body(self.panel, "- (void)silencePresetChanged:(NSPopUpButton *)sender")
@@ -79,8 +80,10 @@ class TranscriptSilenceAccuracyTests(unittest.TestCase):
 
     def test_descending_deletes_keep_original_earlier_coordinates(self):
         self.assertIn("a.startTime > b.startTime", self.batch_delete)
-        self.assertIn("silence.startTime + boundaryPadding", self.batch_delete)
-        self.assertIn("silence.endTime - boundaryPadding", self.batch_delete)
+        self.assertIn(
+            "deleteTimelineRange:silence.startTime end:silence.endTime",
+            self.batch_delete,
+        )
         self.assertNotIn("silence.startTime - totalTimeRemoved", self.batch_delete)
         self.assertNotIn("silence.endTime - totalTimeRemoved", self.batch_delete)
 
@@ -119,7 +122,7 @@ class TranscriptSilenceAccuracyTests(unittest.TestCase):
         self.assertIn("timelineEnd = MAX(timelineEnd, start + itemDuration)", duration)
         self.assertNotIn("@selector(duration)", duration)
 
-    def test_reported_removed_time_uses_padded_cut_duration(self):
+    def test_reported_removed_time_uses_verified_timeline_duration(self):
         self.assertIn('totalTimeRemoved += [result[@"duration"] doubleValue]', self.batch_delete)
         self.assertNotIn("totalTimeRemoved += silence.duration", self.batch_delete)
 
@@ -132,11 +135,11 @@ class TranscriptSilenceAccuracyTests(unittest.TestCase):
         self.assertIn("[self detectAudioSilencesWithCompletion:nil]", refresh)
         self.assertNotIn("transcribeTimeline", refresh)
 
-    def test_bulk_delete_skips_heuristic_pauses_by_default(self):
-        delete_all = method_body(self.panel, "- (NSDictionary *)deleteAllSilences")
-        self.assertIn("includeInferred:NO", delete_all)
-        self.assertIn("silence.inferred && !includeInferred", self.batch_delete)
+    def test_bulk_delete_never_uses_transcript_only_pauses(self):
         self.assertGreaterEqual(self.panel.count("silence.inferred = YES"), 3)
+        self.assertIn("!silence.audioDetected", self.batch_delete)
+        self.assertNotIn("includeInferred", self.header)
+        self.assertNotIn("includeInferred", self.batch_delete)
 
     def test_destructive_path_requires_ffmpeg_confirmation(self):
         self.assertIn("!silence.audioDetected", self.batch_delete)
@@ -344,15 +347,26 @@ class TranscriptSilenceAccuracyTests(unittest.TestCase):
         )
         self.assertLess(runner.index('@"-ss"'), runner.index('@"-i", path'))
 
-    def test_rpc_exposes_padding_and_inferred_opt_in(self):
+    def test_rpc_uses_single_confirmed_range_deletion_path(self):
         handler = method_body(
             self.server,
             "static NSDictionary *SpliceKit_handleTranscriptDeleteSilences",
         )
-        self.assertIn('params[@"boundaryPadding"]', handler)
-        self.assertIn('params[@"includeInferred"]', handler)
-        self.assertIn("boundaryPadding:boundaryPadding", handler)
-        self.assertIn("includeInferred:includeInferred", handler)
+        self.assertIn('params[@"minDuration"]', handler)
+        self.assertIn("deleteSilencesLongerThan:minDuration", handler)
+        self.assertNotIn("boundaryPadding", handler)
+        self.assertNotIn("includeInferred", handler)
+
+    def test_removed_experimental_settings_do_not_reappear(self):
+        for setting in (
+            "audioSilenceConfirmDB",
+            "audioSilenceMergeGap",
+            "audioSilenceRoomTone",
+            "kSpliceKitDefaultSilenceBoundaryPadding",
+            "kSpliceKitDefaultSilenceNoiseDB",
+            "kSpliceKitDefaultSilenceConfirmDB",
+        ):
+            self.assertNotIn(setting, self.panel)
 
 
 if __name__ == "__main__":

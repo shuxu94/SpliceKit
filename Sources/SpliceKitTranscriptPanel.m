@@ -44,10 +44,6 @@ static Class SFSpeechURLRecognitionRequestClass = nil;
 // boundaries are estimates, so bulk deletion must leave a small handle around
 // speech and should not treat normal conversational pauses as dead air.
 static const double kSpliceKitDefaultSilenceThreshold = 0.8;
-static const double kSpliceKitDefaultSilenceBoundaryPadding = 0.175;
-static const double kSpliceKitDefaultSilenceNoiseDB = -50.0;
-static const double kSpliceKitDefaultSilenceConfirmDB = -45.0;
-static const double kSpliceKitDefaultSilenceMergeGap = 0.15;
 // A destructive speech edit must optimize for recall at phoneme boundaries.
 // Silero and energy gates both tend to open late and close early, especially
 // around quiet consonants. Protect at least 100 ms and at least three video
@@ -618,9 +614,6 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
 @property (nonatomic) BOOL suppressPersistenceWrites;
 @property (nonatomic, copy) NSString *lastRestoredSequenceKey;
 @property (nonatomic) double audioSilenceNoiseDB;
-@property (nonatomic) double audioSilenceConfirmDB;
-@property (nonatomic) double audioSilenceMergeGap;
-@property (nonatomic) double audioSilenceRoomTone;
 @property (nonatomic) double audioVoiceVADThreshold;
 @property (nonatomic) double audioVoicePadding;
 @property (nonatomic) double audioVoiceMinimumEvidence;
@@ -632,7 +625,6 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
 @property (nonatomic, copy) NSString *audioSilenceDetectionTimelineFingerprint;
 - (NSString *)audioSilencePlanValidationError;
 - (double)durationSecondsForSequence:(id)sequence;
-- (void)scheduleRetranscribe;
 - (void)scheduleAudioSilenceRedetection;
 @end
 
@@ -665,9 +657,6 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
         // protected edge handles preserve low-energy phoneme boundaries.
         _silenceThreshold = 1.0 / 30.0;
         _audioSilenceNoiseDB = -35.0;
-        _audioSilenceConfirmDB = -35.0;
-        _audioSilenceMergeGap = kSpliceKitDefaultSilenceMergeGap;
-        _audioSilenceRoomTone = 0.0;
         _audioVoiceVADThreshold = 0.25;
         _audioVoicePadding = kSpliceKitMinimumVoiceEdgeProtectionSeconds;
         _audioVoiceMinimumEvidence = 0.05;
@@ -1032,7 +1021,7 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
         for (SpliceKitTranscriptSilence *silence in self.mutableSilences) {
             if (silence.audioDetected && silence.selectedForRemoval && silence.confidence >= 0.9) {
                 confirmed++;
-                removable += MAX(0.0, silence.duration - self.audioSilenceRoomTone);
+                removable += silence.duration;
             }
         }
         self.deleteSilencesButton.enabled = confirmed > 0;
@@ -1513,8 +1502,6 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
         self.audioVoicePadding = 0.120;
     }
     self.silenceThreshold = 1.0 / MAX(self.frameRate, 1.0);
-    self.audioSilenceConfirmDB = self.audioSilenceNoiseDB;
-    self.audioSilenceRoomTone = 0.0;
     [self updateStatusUI:[NSString stringWithFormat:
         @"%@ — %.0f dB + %.2f VAD, %.0f ms voice-edge protection", preset,
         self.audioSilenceNoiseDB, self.audioVoiceVADThreshold,
@@ -1550,9 +1537,7 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     [alert addButtonWithTitle:@"Remove Non-Voice"];
     [alert addButtonWithTitle:@"Cancel"];
     if ([alert runModal] == NSAlertFirstButtonReturn) {
-        NSDictionary *result = [self deleteSilencesLongerThan:self.silenceThreshold
-                                               boundaryPadding:0.0
-                                               includeInferred:NO];
+        NSDictionary *result = [self deleteSilencesLongerThan:self.silenceThreshold];
         if (result[@"error"]) {
             NSString *message = result[@"error"];
             SpliceKit_log(@"[Transcript] Remove Non-Voice refused: %@", message);
@@ -3990,7 +3975,6 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     // core. Edge protection is applied after the exact sequence frame duration
     // is known; zero-buffer destructive edits clip quiet phoneme boundaries.
     self.silenceThreshold = 1.0 / MAX(self.frameRate, 1.0);
-    self.audioSilenceRoomTone = 0.0;
     NSString *ffmpegPath = [self ffmpegExecutablePath];
     if (!ffmpegPath) {
         NSDictionary *result = @{ @"error": @"FFmpeg was not found in /opt/homebrew/bin, /usr/local/bin, or PATH" };
@@ -5791,22 +5775,11 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
 // cannot offer stale pre-edit pause markers for a second destructive pass.
 
 - (NSDictionary *)deleteAllSilences {
-    return [self deleteSilencesLongerThan:0
-                          boundaryPadding:0.0
-                          includeInferred:NO];
+    return [self deleteSilencesLongerThan:0];
 }
 
 - (NSDictionary *)deleteSilencesLongerThan:(double)minDuration {
-    return [self deleteSilencesLongerThan:minDuration
-                          boundaryPadding:0.0
-                          includeInferred:NO];
-}
-
-- (NSDictionary *)deleteSilencesLongerThan:(double)minDuration
-                           boundaryPadding:(double)boundaryPadding
-                           includeInferred:(BOOL)includeInferred {
     [self ensurePersistedStateLoaded];
-    boundaryPadding = MAX(0.0, boundaryPadding);
 
     // Persisted or asynchronously produced ranges must never be applied to a
     // different sequence or to any timeline structure changed after the mask
@@ -5814,25 +5787,15 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     NSString *validationError = [self audioSilencePlanValidationError];
     if (validationError) return @{ @"error": validationError };
 
-    // Collect explicit inter-word gaps by default.  Long-word and
-    // start-to-start heuristics are useful for showing possible pauses, but
-    // are not safe destructive-edit boundaries without audio/VAD confirmation.
+    // Only the current audio analysis can authorize a destructive edit.
+    // Transcript-derived pauses remain useful UI hints but never enter this
+    // collection, whether they were explicit gaps or timing heuristics.
     NSMutableArray<SpliceKitTranscriptSilence *> *toDelete = [NSMutableArray array];
-    NSUInteger skippedInferred = 0;
     NSUInteger skippedUnconfirmed = 0;
-    NSUInteger skippedForPadding = 0;
     for (SpliceKitTranscriptSilence *silence in self.mutableSilences) {
         if (silence.duration < minDuration) continue;
         if (!silence.audioDetected || !silence.selectedForRemoval || silence.confidence < 0.9) {
             skippedUnconfirmed++;
-            continue;
-        }
-        if (silence.inferred && !includeInferred) {
-            skippedInferred++;
-            continue;
-        }
-        if (silence.duration <= boundaryPadding * 2.0) {
-            skippedForPadding++;
             continue;
         }
         [toDelete addObject:silence];
@@ -5842,18 +5805,14 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
         return @{
             @"status": @"ok",
             @"deletedCount": @0,
-            @"skippedInferred": @(skippedInferred),
             @"skippedUnconfirmed": @(skippedUnconfirmed),
-            @"skippedForPadding": @(skippedForPadding),
-            @"boundaryPadding": @(boundaryPadding),
             @"message": @"No confirmed audio silences found. Run Detect Audio first.",
         };
     }
 
-    SpliceKit_log(@"[Transcript] Batch deleting %lu explicit silences "
-                  @"(min duration: %.2fs, padding: %.2fs/side, inferred: %@)",
-                  (unsigned long)toDelete.count, minDuration, boundaryPadding,
-                  includeInferred ? @"included" : @"skipped");
+    SpliceKit_log(@"[Transcript] Batch deleting %lu confirmed audio silences "
+                  @"(min duration: %.2fs)",
+                  (unsigned long)toDelete.count, minDuration);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         [self updateStatusUI:[NSString stringWithFormat:@"Deleting %lu pauses...", (unsigned long)toDelete.count]];
@@ -5878,15 +5837,13 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     // Sleeps are reduced from 50ms to 20ms since these are direct ObjC calls
     // that execute synchronously — the sleep is just for FCP's internal state to settle.
     for (SpliceKitTranscriptSilence *silence in toDelete) {
-        // Keep speech handles on both sides because ASR word boundaries are
-        // estimates and often land inside leading/trailing consonants.
-        double cutStart = silence.startTime + boundaryPadding;
-        double cutEnd = silence.endTime - boundaryPadding;
-
-        NSDictionary *result = [self deleteTimelineRange:cutStart end:cutEnd];
+        // Voice-edge protection and frame rounding were already applied when
+        // this confirmed range was detected. Apply those coordinates exactly.
+        NSDictionary *result = [self deleteTimelineRange:silence.startTime end:silence.endTime];
         if (result[@"error"]) {
             lastError = result[@"error"];
-            SpliceKit_log(@"[Transcript] Error deleting silence at %.2fs: %@", cutStart, lastError);
+            SpliceKit_log(@"[Transcript] Error deleting silence at %.2fs: %@",
+                silence.startTime, lastError);
             break;
         } else {
             deletedCount++;
@@ -5910,11 +5867,7 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     response[@"deletedCount"] = @(deletedCount);
     response[@"totalSilences"] = @(toDelete.count);
     response[@"timeRemoved"] = @(totalTimeRemoved);
-    response[@"boundaryPadding"] = @(boundaryPadding);
-    response[@"skippedInferred"] = @(skippedInferred);
     response[@"skippedUnconfirmed"] = @(skippedUnconfirmed);
-    response[@"skippedForPadding"] = @(skippedForPadding);
-    response[@"includedInferred"] = @(includeInferred);
     response[@"audioVerificationScheduled"] = @YES;
     if (lastError) response[@"lastError"] = lastError;
 
@@ -6055,20 +6008,6 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     });
 
     return result;
-}
-
-- (void)scheduleRetranscribe {
-    SpliceKit_log(@"[Transcript] Scheduling re-transcribe after edit...");
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self updateStatusUI:@"Refreshing transcript..."];
-        self.spinner.hidden = NO;
-        [self.spinner startAnimation:nil];
-    });
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        [self transcribeTimeline];
-    });
 }
 
 - (void)scheduleAudioSilenceRedetection {
@@ -6415,9 +6354,6 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
     state[@"audioSilenceDetectionRunning"] = @(self.audioSilenceDetectionRunning);
     state[@"audioSilenceSettings"] = @{
         @"noiseThresholdDB": @(self.audioSilenceNoiseDB),
-        @"confirmationThresholdDB": @(self.audioSilenceConfirmDB),
-        @"mergeGap": @(self.audioSilenceMergeGap),
-        @"roomTone": @(self.audioSilenceRoomTone),
         @"voiceEdgeProtection": @(self.audioVoicePadding),
         @"voiceEdgeProtectionFrames": @(self.audioVoicePadding * MAX(self.frameRate, 1.0)),
     };

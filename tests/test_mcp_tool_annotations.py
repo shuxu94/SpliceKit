@@ -155,6 +155,20 @@ class MCPToolAnnotationTests(unittest.TestCase):
             ],
         )
 
+    def test_silence_removal_forwards_only_the_supported_filter(self):
+        calls = []
+
+        def fake_call(method, **params):
+            calls.append((method, params))
+            return {"status": "ok", "deletedCount": 2, "totalSilences": 2}
+
+        self.module.bridge.call = fake_call
+
+        result = self.module.delete_transcript_silences(min_duration=0.8)
+
+        self.assertEqual(calls, [("transcript.deleteSilences", {"minDuration": 0.8})])
+        self.assertIn("Deleted: 2/2 silences", result)
+
     def test_background_render_wrappers_forward_expected_bridge_calls(self):
         calls = []
 
