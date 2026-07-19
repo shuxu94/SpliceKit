@@ -507,6 +507,7 @@ CUSTOM_TOOL_TITLES = {
     "import_url_status": "URL Import Status",
     "cancel_import_url": "Cancel URL Import",
     "open_captions": "Open Captions Panel",
+    "set_caption_engine": "Set Caption Engine",
     "close_captions": "Close Captions Panel",
     "get_caption_state": "Get Caption State",
     "get_caption_styles": "Get Caption Styles",
@@ -6673,16 +6674,16 @@ def set_transcript_engine(engine: str) -> str:
 # Social Media Captions
 # ============================================================
 # Word-by-word highlighted, animated caption titles overlaid
-# on the timeline as a connected storyline. Uses the Parakeet
+# on the timeline as a connected storyline. Uses the selected
 # transcript engine for word timing, then generates styled
 # FCPXML title elements and imports via pasteboard.
 
 
 @mcp.tool(annotations=_tool_annotations("open_captions"))
-def open_captions(file_url: str = "", style: str = "") -> str:
+def open_captions(file_url: str = "", style: str = "", engine: str = "") -> str:
     """Open the social captions panel and start transcribing the timeline.
 
-    Transcribes timeline audio using Parakeet (word-level timing), then lets
+    Transcribes timeline audio using the selected engine, then lets
     you choose a visual style and generate social-media-style captions
     (word-by-word highlighted, animated) as FCPXML title clips.
 
@@ -6691,6 +6692,8 @@ def open_captions(file_url: str = "", style: str = "") -> str:
                   If empty, transcribes all clips on the current timeline.
         style: Optional preset ID to apply (e.g. "bold_pop", "neon_glow").
                Use get_caption_styles() to see all available presets.
+        engine: Optional transcription engine override: "appleSpeech",
+                "parakeetV3", "whisperLargeV3Turbo", or "whisperLargeV3".
 
     Transcription is async — use get_caption_state() to check progress.
     """
@@ -6699,7 +6702,23 @@ def open_captions(file_url: str = "", style: str = "") -> str:
         params["fileURL"] = file_url
     if style:
         params["style"] = style
+    if engine:
+        params["engine"] = engine
     r = bridge.call("captions.open", **params)
+    if _err(r):
+        return f"Error: {r.get('error', r)}"
+    return _fmt(r)
+
+
+@mcp.tool(annotations=_tool_annotations("set_caption_engine"))
+def set_caption_engine(engine: str) -> str:
+    """Set the transcription engine used by the social captions panel.
+
+    Args:
+        engine: One of "appleSpeech", "parakeetV3",
+                "whisperLargeV3Turbo", or "whisperLargeV3".
+    """
+    r = bridge.call("captions.setEngine", engine=engine)
     if _err(r):
         return f"Error: {r.get('error', r)}"
     return _fmt(r)
@@ -6728,6 +6747,7 @@ def get_caption_state() -> str:
     lines = [f"Status: {r.get('status', 'unknown')}"]
     lines.append(f"Words: {r.get('wordCount', 0)}")
     lines.append(f"Segments: {r.get('segmentCount', 0)}")
+    lines.append(f"Engine: {r.get('engine', 'unknown')}")
 
     if r.get('style'):
         s = r['style']
