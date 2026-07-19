@@ -9,8 +9,8 @@
 //  word in a segment gets its own sequential title where that word is
 //  highlighted and the rest are dimmed.
 //
-//  Transcription is handled directly via the Parakeet engine (no dependency
-//  on the Transcript Editor panel).
+//  Transcription is handled directly by the selected engine (no dependency
+//  on the Transcript Editor panel's state).
 //
 
 #import "SpliceKitCaptionPanel.h"
@@ -21,6 +21,7 @@
 #import <float.h>
 #import <math.h>
 #import <QuartzCore/QuartzCore.h>
+#import <AVFoundation/AVFoundation.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <dlfcn.h>
 
@@ -32,6 +33,28 @@
 #endif
 
 NSNotificationName const SpliceKitCaptionDidGenerateNotification = @"SpliceKitCaptionDidGenerate";
+
+// FCP does not necessarily load Speech.framework before SpliceKit. Resolve the
+// classes dynamically so the social captions channel can use Apple Speech
+// without introducing a hard dependency on the Transcript Editor panel.
+static Class SpliceKitCaption_SFSpeechRecognizerClass = Nil;
+static Class SpliceKitCaption_SFSpeechURLRecognitionRequestClass = Nil;
+
+static BOOL SpliceKitCaption_loadSpeechFramework(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSBundle *bundle = [NSBundle bundleWithPath:@"/System/Library/Frameworks/Speech.framework"];
+        if ([bundle load]) {
+            SpliceKitCaption_SFSpeechRecognizerClass = objc_getClass("SFSpeechRecognizer");
+            SpliceKitCaption_SFSpeechURLRecognitionRequestClass = objc_getClass("SFSpeechURLRecognitionRequest");
+        }
+        SpliceKit_log(@"[Captions] Speech.framework loaded: recognizer=%@ request=%@",
+                      SpliceKitCaption_SFSpeechRecognizerClass,
+                      SpliceKitCaption_SFSpeechURLRecognitionRequestClass);
+    });
+    return SpliceKitCaption_SFSpeechRecognizerClass &&
+           SpliceKitCaption_SFSpeechURLRecognitionRequestClass;
+}
 
 // Flipped document view so NSScrollView shows content top-down. Without this, an
 // unflipped doc view's origin is at the bottom-left and the scroll view can show
@@ -859,6 +882,8 @@ static void SpliceKit_installDragSpy(void) {
     self.enginePopup.controlSize = NSControlSizeRegular;
     [self.enginePopup addItemWithTitle:@"Parakeet v3 (Fast, ~475 MB)"];
     self.enginePopup.lastItem.representedObject = @"parakeetV3";
+    [self.enginePopup addItemWithTitle:@"Apple Speech (On-device)"];
+    self.enginePopup.lastItem.representedObject = @"appleSpeech";
     [self.enginePopup addItemWithTitle:@"Whisper large-v3-turbo (~800 MB)"];
     self.enginePopup.lastItem.representedObject = @"whisperLargeV3Turbo";
     [self.enginePopup addItemWithTitle:@"Whisper large-v3 (Highest quality, ~1.5 GB)"];
@@ -1477,6 +1502,30 @@ static void SpliceKit_installDragSpy(void) {
     return [[NSUserDefaults standardUserDefaults] stringForKey:@"SpliceKitCaptionEngine"] ?: @"whisperLargeV3";
 }
 
+- (BOOL)setTranscriptionEngine:(NSString *)engineID {
+    NSSet *validEngines = [NSSet setWithObjects:@"appleSpeech", @"parakeetV3",
+        @"whisperLargeV3Turbo", @"whisperLargeV3", nil];
+    if (![validEngines containsObject:engineID]) return NO;
+
+    [[NSUserDefaults standardUserDefaults] setObject:engineID forKey:@"SpliceKitCaptionEngine"];
+    if (self.enginePopup) {
+        SpliceKit_executeOnMainThread(^{
+            for (NSMenuItem *item in self.enginePopup.itemArray) {
+                if ([item.representedObject isEqual:engineID]) {
+                    [self.enginePopup selectItem:item];
+                    break;
+                }
+            }
+        });
+    }
+    SpliceKit_log(@"[Captions] Transcription engine set to: %@", engineID);
+    return YES;
+}
+
+- (NSString *)transcriptionEngine {
+    return [self currentEngineID];
+}
+
 - (void)fontChanged:(id)sender { self.style.font = self.fontPopup.titleOfSelectedItem; [self updatePreview]; [self persistCaptionDraftStateForCurrentSequence]; }
 - (void)fontSizeChanged:(id)sender {
     self.style.fontSize = self.fontSizeSlider.doubleValue;
@@ -1973,12 +2022,29 @@ static void SpliceKit_installDragSpy(void) {
         state[@"transcript"] = [self captionTranscriptPersistenceSection];
     }
 
+    NSString *sequenceKey = [state[@"sequenceIdentity"] isKindOfClass:[NSDictionary class]]
+        ? state[@"sequenceIdentity"][@"cacheKey"] : nil;
+
     NSError *error = nil;
-    if (!SpliceKit_saveSequenceState(sequence, state, &error) && error) {
+    BOOL saved = SpliceKit_saveSequenceState(sequence, state, &error);
+    if (!saved && error) {
         SpliceKit_log(@"[Captions] Failed to persist generated caption state: %@", error.localizedDescription);
     }
-    self.lastHeadlessRestoredSequenceKey = nil;
-    self.lastHealedSequenceKey = nil;
+
+    // Direct insertion has already applied text, styling, and position to every
+    // generated title. Mark this sequence healed and invalidate restore timers
+    // scheduled before generation began. Clearing these keys here previously
+    // caused a delayed retry to rewrite all fresh titles while FCP's text
+    // inspector was rendering, crashing TXStylePreviewController.
+    if (saved && sequenceKey.length > 0) {
+        SpliceKit_executeOnMainThread(^{
+            self.lastHeadlessRestoredSequenceKey = sequenceKey;
+            self.lastHealedSequenceKey = sequenceKey;
+            self.automaticRestoreGeneration += 1;
+        });
+        SpliceKit_log(@"[Captions] Freshly generated titles marked healed for %@; pending restore retries cancelled",
+                      sequenceKey);
+    }
 }
 
 - (CGFloat)yOffsetForStyle:(SpliceKitCaptionStyle *)style {
@@ -2010,7 +2076,7 @@ static void SpliceKit_installDragSpy(void) {
     return [self.style copy];
 }
 
-#pragma mark - Transcription (Built-in Parakeet)
+#pragma mark - Transcription
 
 - (void)transcribeTimeline {
     self.status = SpliceKitCaptionStatusTranscribing;
@@ -2981,8 +3047,362 @@ static NSData *SpliceKitWhisperServe_request(NSString *binaryPath, NSString *mod
     return result;
 }
 
+#pragma mark - Apple Speech caption transcription
+
+- (NSURL *)appleSpeechAudioRangeForURL:(NSURL *)mediaURL
+                                  start:(double)rangeStart
+                               duration:(double)rangeDuration
+                                  error:(NSString **)errorOut {
+    if (!isfinite(rangeStart) || rangeStart < 0 ||
+        !isfinite(rangeDuration) || rangeDuration <= 0) {
+        if (errorOut) *errorOut = @"Invalid source range for Apple Speech transcription.";
+        return nil;
+    }
+
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:mediaURL options:nil];
+    AVAssetExportSession *exporter = [[AVAssetExportSession alloc]
+        initWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
+    if (!exporter) {
+        if (errorOut) *errorOut = [NSString stringWithFormat:
+            @"Could not prepare the audio range from %@ for Apple Speech.", mediaURL.lastPathComponent];
+        return nil;
+    }
+
+    NSString *filename = [NSString stringWithFormat:@"splicekit-apple-speech-%@.m4a",
+        [NSUUID UUID].UUIDString];
+    NSURL *outputURL = [NSURL fileURLWithPath:
+        [NSTemporaryDirectory() stringByAppendingPathComponent:filename]];
+    exporter.outputURL = outputURL;
+    exporter.outputFileType = AVFileTypeAppleM4A;
+    exporter.shouldOptimizeForNetworkUse = NO;
+    exporter.timeRange = CMTimeRangeMake(
+        CMTimeMakeWithSeconds(rangeStart, 600),
+        CMTimeMakeWithSeconds(rangeDuration, 600));
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [exporter exportAsynchronouslyWithCompletionHandler:^{
+        dispatch_semaphore_signal(sem);
+    }];
+    NSTimeInterval timeout = MIN(MAX(60.0, rangeDuration + 30.0), 300.0);
+    long waitResult = dispatch_semaphore_wait(sem,
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)));
+    if (waitResult != 0) {
+        [exporter cancelExport];
+        [[NSFileManager defaultManager] removeItemAtURL:outputURL error:nil];
+        if (errorOut) *errorOut = [NSString stringWithFormat:
+            @"Timed out extracting audio from %@.", mediaURL.lastPathComponent];
+        return nil;
+    }
+    if (exporter.status != AVAssetExportSessionStatusCompleted) {
+        NSString *detail = exporter.error.localizedDescription ?: @"Unsupported media range";
+        [[NSFileManager defaultManager] removeItemAtURL:outputURL error:nil];
+        if (errorOut) *errorOut = [NSString stringWithFormat:
+            @"Could not extract audio from %@: %@", mediaURL.lastPathComponent, detail];
+        return nil;
+    }
+
+    SpliceKit_log(@"[Captions] Apple Speech extracted %@ [%.3f, %.3f] to %@",
+        mediaURL.lastPathComponent, rangeStart, rangeStart + rangeDuration,
+        outputURL.lastPathComponent);
+    return outputURL;
+}
+
+- (BOOL)ensureAppleSpeechAuthorization:(NSString **)errorOut {
+    if (!SpliceKitCaption_loadSpeechFramework()) {
+        if (errorOut) *errorOut = @"Apple Speech framework is not available.";
+        return NO;
+    }
+
+    SEL statusSel = NSSelectorFromString(@"authorizationStatus");
+    NSInteger status = ((NSInteger (*)(Class, SEL))objc_msgSend)(
+        SpliceKitCaption_SFSpeechRecognizerClass, statusSel);
+    SpliceKit_log(@"[Captions] Apple Speech authorization status: %ld", (long)status);
+    if (status == 3) return YES;
+
+    if (status == 0) {
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block NSInteger newStatus = status;
+        SEL requestSel = NSSelectorFromString(@"requestAuthorization:");
+        ((void (*)(Class, SEL, id))objc_msgSend)(
+            SpliceKitCaption_SFSpeechRecognizerClass, requestSel, ^(NSInteger callbackStatus) {
+                newStatus = callbackStatus;
+                dispatch_semaphore_signal(sem);
+            });
+        long waitResult = dispatch_semaphore_wait(sem,
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60.0 * NSEC_PER_SEC)));
+        if (waitResult != 0) {
+            if (errorOut) *errorOut = @"Apple Speech authorization request timed out.";
+            return NO;
+        }
+        status = newStatus;
+        SpliceKit_log(@"[Captions] Apple Speech authorization callback: %ld", (long)status);
+    }
+
+    // Match the Transcript Editor behavior: on-device recognition can work even
+    // when the host application's authorization state is denied or restricted.
+    // The recognition task will return a precise error if this machine disallows it.
+    return YES;
+}
+
+- (NSArray<NSDictionary *> *)appleSpeechSegmentsForURL:(NSURL *)mediaURL
+                                                  start:(double)rangeStart
+                                               duration:(double)rangeDuration
+                                                  error:(NSString **)errorOut {
+    if (![[NSFileManager defaultManager] fileExistsAtPath:mediaURL.path]) {
+        if (errorOut) *errorOut = [NSString stringWithFormat:@"Media file not found: %@", mediaURL.lastPathComponent];
+        return nil;
+    }
+
+    id recognizer = ((id (*)(id, SEL, id))objc_msgSend)(
+        [SpliceKitCaption_SFSpeechRecognizerClass alloc],
+        NSSelectorFromString(@"initWithLocale:"),
+        [NSLocale localeWithLocaleIdentifier:@"en-US"]);
+    if (!recognizer) {
+        if (errorOut) *errorOut = @"Could not create the Apple Speech recognizer.";
+        return nil;
+    }
+    if (!((BOOL (*)(id, SEL))objc_msgSend)(recognizer, NSSelectorFromString(@"isAvailable"))) {
+        if (errorOut) *errorOut = @"Apple Speech recognizer is currently unavailable.";
+        return nil;
+    }
+
+    NSString *extractError = nil;
+    NSURL *recognitionURL = [self appleSpeechAudioRangeForURL:mediaURL
+        start:rangeStart duration:rangeDuration error:&extractError];
+    if (!recognitionURL) {
+        if (errorOut) *errorOut = extractError ?: @"Could not extract timeline audio for Apple Speech.";
+        return nil;
+    }
+
+    id request = ((id (*)(id, SEL, id))objc_msgSend)(
+        [SpliceKitCaption_SFSpeechURLRecognitionRequestClass alloc],
+        NSSelectorFromString(@"initWithURL:"), recognitionURL);
+    if (!request) {
+        [[NSFileManager defaultManager] removeItemAtURL:recognitionURL error:nil];
+        if (errorOut) *errorOut = @"Could not create an Apple Speech file request.";
+        return nil;
+    }
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(request,
+        NSSelectorFromString(@"setShouldReportPartialResults:"), NO);
+    SEL onDeviceSel = NSSelectorFromString(@"setRequiresOnDeviceRecognition:");
+    if ([request respondsToSelector:onDeviceSel]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(request, onDeviceSel, YES);
+    }
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block NSArray<NSDictionary *> *finalSegments = nil;
+    __block NSError *recognitionError = nil;
+    __block BOOL completed = NO;
+
+    SEL taskSel = NSSelectorFromString(@"recognitionTaskWithRequest:resultHandler:");
+    id task = ((id (*)(id, SEL, id, id))objc_msgSend)(recognizer, taskSel, request,
+        ^(id result, NSError *error) {
+            @synchronized (request) {
+                if (completed) return;
+                BOOL isFinal = result
+                    ? ((BOOL (*)(id, SEL))objc_msgSend)(result, NSSelectorFromString(@"isFinal"))
+                    : NO;
+                if (error && (!result || !isFinal)) {
+                    recognitionError = error;
+                    completed = YES;
+                    dispatch_semaphore_signal(sem);
+                    return;
+                }
+                if (!result || !isFinal) {
+                    return;
+                }
+
+                id transcription = ((id (*)(id, SEL))objc_msgSend)(result,
+                    NSSelectorFromString(@"bestTranscription"));
+                NSArray *segments = transcription
+                    ? ((id (*)(id, SEL))objc_msgSend)(transcription, NSSelectorFromString(@"segments"))
+                    : nil;
+                NSMutableArray *parsed = [NSMutableArray array];
+                SpliceKit_log(@"[Captions] Apple Speech raw result for %@ range %.3f-%.3f: %lu segments",
+                    mediaURL.lastPathComponent, rangeStart, rangeStart + rangeDuration,
+                    (unsigned long)segments.count);
+                for (id segment in segments ?: @[]) {
+                    double timestamp = ((double (*)(id, SEL))objc_msgSend)(segment,
+                        NSSelectorFromString(@"timestamp"));
+                    if (timestamp < 0 || timestamp >= rangeDuration) continue;
+                    double duration = ((double (*)(id, SEL))objc_msgSend)(segment,
+                        NSSelectorFromString(@"duration"));
+                    NSString *word = ((id (*)(id, SEL))objc_msgSend)(segment,
+                        NSSelectorFromString(@"substring"));
+                    float confidence = ((float (*)(id, SEL))objc_msgSend)(segment,
+                        NSSelectorFromString(@"confidence"));
+                    if (word.length == 0) continue;
+                    [parsed addObject:@{
+                        @"word": word,
+                        // The extracted file starts at zero. Restore source-file
+                        // coordinates so the caller's existing timeline mapping
+                        // remains identical to the helper-engine path.
+                        @"startTime": @(rangeStart + timestamp),
+                        @"duration": @(MAX(duration, 0)),
+                        @"confidence": @(confidence),
+                    }];
+                }
+                finalSegments = [parsed copy];
+                recognitionError = error;
+                completed = YES;
+                dispatch_semaphore_signal(sem);
+            }
+        });
+
+    NSTimeInterval timeout = MIN(MAX(120.0, rangeDuration * 2.0 + 30.0), 1800.0);
+    long waitResult = dispatch_semaphore_wait(sem,
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)));
+    if (waitResult != 0) {
+        SEL cancelSel = NSSelectorFromString(@"cancel");
+        if ([task respondsToSelector:cancelSel]) ((void (*)(id, SEL))objc_msgSend)(task, cancelSel);
+        [[NSFileManager defaultManager] removeItemAtURL:recognitionURL error:nil];
+        if (errorOut) *errorOut = [NSString stringWithFormat:
+            @"Apple Speech timed out while transcribing %@.", mediaURL.lastPathComponent];
+        return nil;
+    }
+    if (recognitionError && !finalSegments) {
+        [[NSFileManager defaultManager] removeItemAtURL:recognitionURL error:nil];
+        if (errorOut) *errorOut = [NSString stringWithFormat:@"Apple Speech failed for %@: %@",
+            mediaURL.lastPathComponent, recognitionError.localizedDescription ?: @"Unknown error"];
+        return nil;
+    }
+    [[NSFileManager defaultManager] removeItemAtURL:recognitionURL error:nil];
+    return finalSegments ?: @[];
+}
+
+- (void)performAppleSpeechCaptionTranscription {
+    NSString *authorizationError = nil;
+    if (![self ensureAppleSpeechAuthorization:&authorizationError]) {
+        [self transcriptionFailedWithError:authorizationError ?: @"Apple Speech is not authorized."];
+        return;
+    }
+    SpliceKitTranscriptDiag_logAppleSpeechState();
+
+    __block NSArray *clips = nil;
+    SpliceKit_executeOnMainThread(^{
+        @try {
+            id timeline = SpliceKit_getActiveTimelineModule();
+            if (!timeline) {
+                [self transcriptionFailedWithError:@"No active timeline. Open a project first."];
+                return;
+            }
+            if ([timeline respondsToSelector:@selector(sequenceFrameDuration)]) {
+                SpliceKitCaption_CMTime fd = ((SpliceKitCaption_CMTime (*)(id, SEL))STRET_MSG)(
+                    timeline, @selector(sequenceFrameDuration));
+                if (fd.timescale > 0 && fd.value > 0) {
+                    self.frameRate = (double)fd.timescale / fd.value;
+                    self.fdNum = (int)fd.value;
+                    self.fdDen = (int)fd.timescale;
+                }
+            }
+            id sequence = ((id (*)(id, SEL))objc_msgSend)(timeline, @selector(sequence));
+            if (!sequence) {
+                [self transcriptionFailedWithError:@"No sequence in timeline."];
+                return;
+            }
+            id primaryObject = [sequence respondsToSelector:@selector(primaryObject)]
+                ? ((id (*)(id, SEL))objc_msgSend)(sequence, @selector(primaryObject)) : nil;
+            NSString *collectError = nil;
+            clips = [self collectClipInfosForSequence:sequence primaryObject:primaryObject
+                                          errorMessage:&collectError];
+            if (!clips) [self transcriptionFailedWithError:collectError ?: @"No items on timeline."];
+        } @catch (NSException *e) {
+            [self transcriptionFailedWithError:[NSString stringWithFormat:@"Error reading timeline: %@", e.reason]];
+        }
+    });
+    if (!clips || clips.count == 0) {
+        if (self.status != SpliceKitCaptionStatusError) {
+            [self transcriptionFailedWithError:@"No media clips found on timeline."];
+        }
+        return;
+    }
+
+    static NSSet<NSString *> *imageExtensions;
+    if (!imageExtensions) {
+        imageExtensions = [NSSet setWithObjects:@"png", @"jpg", @"jpeg", @"heic", @"heif",
+            @"gif", @"tiff", @"tif", @"bmp", @"webp", nil];
+    }
+    NSMutableArray *transcribableClips = [NSMutableArray array];
+    for (NSDictionary *clipInfo in clips) {
+        NSURL *mediaURL = clipInfo[@"mediaURL"];
+        if (!mediaURL || [imageExtensions containsObject:mediaURL.pathExtension.lowercaseString]) continue;
+        if ([clipInfo[@"duration"] doubleValue] < 0.5) continue;
+        [transcribableClips addObject:clipInfo];
+    }
+    if (transcribableClips.count == 0) {
+        [self transcriptionFailedWithError:@"No transcribable clips found on timeline."];
+        return;
+    }
+
+    SpliceKitTranscriptDiag_logClipInfos(transcribableClips, @"Apple Speech");
+    NSMutableArray<SpliceKitTranscriptWord *> *allWords = [NSMutableArray array];
+    for (NSUInteger i = 0; i < transcribableClips.count; i++) {
+        NSDictionary *clipInfo = transcribableClips[i];
+        NSURL *mediaURL = clipInfo[@"mediaURL"];
+        double timelineStart = [clipInfo[@"timelineStart"] doubleValue];
+        double trimStart = [clipInfo[@"trimStart"] doubleValue];
+        double mediaOrigin = [clipInfo[@"mediaOrigin"] doubleValue];
+        double clipDuration = [clipInfo[@"duration"] doubleValue];
+        double wordTimeOffset = clipInfo[@"wordTimeOffset"] ? [clipInfo[@"wordTimeOffset"] doubleValue] : 0;
+        double transcribeDuration = clipInfo[@"transcribeDuration"]
+            ? [clipInfo[@"transcribeDuration"] doubleValue] : MAX(0, clipDuration - wordTimeOffset);
+        double fileRelativeTrimStart = MAX(0, trimStart - mediaOrigin);
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.statusLabel.stringValue = [NSString stringWithFormat:@"Apple Speech: clip %lu/%lu...",
+                (unsigned long)(i + 1), (unsigned long)transcribableClips.count];
+            self.progressBar.indeterminate = NO;
+            self.progressBar.doubleValue = (double)i / transcribableClips.count;
+        });
+
+        NSString *clipError = nil;
+        NSArray<NSDictionary *> *segments = [self appleSpeechSegmentsForURL:mediaURL
+            start:fileRelativeTrimStart duration:transcribeDuration error:&clipError];
+        if (!segments) {
+            [self transcriptionFailedWithError:clipError ?: @"Apple Speech transcription failed."];
+            return;
+        }
+
+        for (NSDictionary *segment in segments) {
+            double sourceTimestamp = [segment[@"startTime"] doubleValue];
+            double relativeStart = sourceTimestamp - fileRelativeTrimStart;
+            if (relativeStart < 0 || relativeStart + wordTimeOffset >= clipDuration) continue;
+            double duration = [segment[@"duration"] doubleValue];
+            duration = MIN(MAX(duration, [self captionFrameDurationSeconds]),
+                           clipDuration - wordTimeOffset - relativeStart);
+
+            SpliceKitTranscriptWord *word = [[SpliceKitTranscriptWord alloc] init];
+            word.text = segment[@"word"] ?: @"";
+            word.startTime = timelineStart + wordTimeOffset + relativeStart;
+            word.duration = duration;
+            word.endTime = word.startTime + duration;
+            word.confidence = [segment[@"confidence"] doubleValue];
+            word.clipHandle = clipInfo[@"handle"];
+            word.clipTimelineStart = timelineStart;
+            word.sourceMediaOffset = trimStart;
+            word.sourceMediaTime = sourceTimestamp + mediaOrigin;
+            word.sourceMediaPath = mediaURL.path;
+            [allWords addObject:word];
+        }
+    }
+
+    if (allWords.count == 0) {
+        [self transcriptionFailedWithError:@"Apple Speech produced no words. The timeline may be silent or the selected locale may not support on-device recognition."];
+        return;
+    }
+    SpliceKit_log(@"[Captions] Apple Speech transcription complete: %lu words",
+                  (unsigned long)allWords.count);
+    [self transcriptionFinishedWithWords:allWords];
+}
+
 - (void)performCaptionTranscription {
     NSString *engineID = [self currentEngineID];
+
+    if ([engineID isEqualToString:@"appleSpeech"]) {
+        SpliceKit_log(@"[Captions] Starting transcription with engine: Apple Speech");
+        [self performAppleSpeechCaptionTranscription];
+        return;
+    }
 
     // Engine-specific resolution: binary path, model arg, user-facing label.
     NSString *binaryPath = nil;
@@ -6705,6 +7125,7 @@ static BOOL SpliceKitCaption_pollMainThread(BOOL (^condition)(void), double time
 
     state[@"wordCount"] = @(self.mutableWords.count);
     state[@"segmentCount"] = @(self.mutableSegments.count);
+    state[@"engine"] = [self currentEngineID];
     state[@"style"] = [self.style toDictionary];
     state[@"transcriptText"] = [self editableTranscriptText];
 

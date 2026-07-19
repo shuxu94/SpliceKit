@@ -628,8 +628,8 @@ void SpliceKitTranscriptDiag_logAppleSpeechState(void) {
         SpliceKit_log(@"[TranscriptDiag]   Authorization: %@ (%ld)", statusName, (long)status);
 
         if (status != 3) {
-            SpliceKit_log(@"[TranscriptDiag]   ⚠ Not authorized — FCP has no NSSpeechRecognitionUsageDescription, "
-                           "so macOS can't show the permission dialog. On-device recognition may still work.");
+            SpliceKit_log(@"[TranscriptDiag]   ⚠ Not authorized. On-device recognition may still work; "
+                           "otherwise grant Speech Recognition access to this FCP build.");
         }
     }
 
@@ -655,11 +655,16 @@ void SpliceKitTranscriptDiag_logAppleSpeechState(void) {
         }
     }
 
-    // Check speaker diarization availability (macOS 26+)
+    // Check speaker diarization availability without constructing a request.
+    // SFSpeechURLRecognitionRequest deliberately rejects plain -init and must
+    // only be created with -initWithURL:. Calling -init here used to raise an
+    // uncaught NSGenericException during diagnostics before transcription began.
     SEL diarSel = NSSelectorFromString(@"setAddsSpeakerAttribution:");
     if (requestClass) {
-        id testReq = [[requestClass alloc] init];
-        if (testReq && [testReq respondsToSelector:diarSel]) {
+        SEL instancesRespondSel = NSSelectorFromString(@"instancesRespondToSelector:");
+        BOOL supportsDiarization = ((BOOL (*)(Class, SEL, SEL))objc_msgSend)(
+            requestClass, instancesRespondSel, diarSel);
+        if (supportsDiarization) {
             SpliceKit_log(@"[TranscriptDiag]   Speaker diarization: available (macOS 26+)");
         } else {
             SpliceKit_log(@"[TranscriptDiag]   Speaker diarization: not available");

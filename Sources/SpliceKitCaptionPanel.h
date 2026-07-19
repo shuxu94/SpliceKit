@@ -128,8 +128,10 @@ extern NSNotificationName const SpliceKitCaptionDidGenerateNotification;
 - (void)hidePanel;
 - (BOOL)isVisible;
 
-// Transcription (delegates to SpliceKitTranscriptPanel)
+// Transcription
 - (void)transcribeTimeline;
+- (BOOL)setTranscriptionEngine:(NSString *)engineID;
+- (NSString *)transcriptionEngine;
 - (void)setWordsManually:(NSArray<NSDictionary *> *)wordDicts;
 - (NSDictionary *)setTranscriptText:(NSString *)text;
 - (NSString *)editableTranscriptText;

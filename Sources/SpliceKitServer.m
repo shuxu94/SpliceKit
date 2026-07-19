@@ -6899,12 +6899,21 @@ static NSDictionary *SpliceKit_handleTranscriptSetSpeaker(NSDictionary *params) 
 static NSDictionary *SpliceKit_handleCaptionsOpen(NSDictionary *params) {
     NSString *fileURL = params[@"fileURL"];
     NSString *presetID = params[@"style"];
+    NSString *engineID = params[@"engine"];
+    if (engineID) {
+        NSSet *validEngines = [NSSet setWithObjects:@"appleSpeech", @"parakeetV3",
+            @"whisperLargeV3Turbo", @"whisperLargeV3", nil];
+        if (![validEngines containsObject:engineID]) {
+            return @{@"error": @"Unknown caption engine. Use 'appleSpeech', 'parakeetV3', 'whisperLargeV3Turbo', or 'whisperLargeV3'"};
+        }
+    }
     __block BOOL startedTranscription = NO;
     __block BOOL restoredCaptions = NO;
     __block BOOL alreadyTranscribing = NO;
 
     SpliceKit_executeOnMainThread(^{
         SpliceKitCaptionPanel *panel = [SpliceKitCaptionPanel sharedPanel];
+        if (engineID) [panel setTranscriptionEngine:engineID];
         if (presetID) {
             SpliceKitCaptionStyle *style = [SpliceKitCaptionStyle presetWithID:presetID];
             if (style) [panel setStyle:style];
@@ -6953,6 +6962,18 @@ static NSDictionary *SpliceKit_handleCaptionsClose(NSDictionary *params) {
 
 static NSDictionary *SpliceKit_handleCaptionsGetState(NSDictionary *params) {
     return [[SpliceKitCaptionPanel sharedPanel] getState] ?: @{@"status": @"idle"};
+}
+
+static NSDictionary *SpliceKit_handleCaptionsSetEngine(NSDictionary *params) {
+    NSString *engineID = params[@"engine"];
+    if (!engineID) {
+        return @{@"error": @"engine is required ('appleSpeech', 'parakeetV3', 'whisperLargeV3Turbo', or 'whisperLargeV3')"};
+    }
+    SpliceKitCaptionPanel *panel = [SpliceKitCaptionPanel sharedPanel];
+    if (![panel setTranscriptionEngine:engineID]) {
+        return @{@"error": @"Unknown caption engine. Use 'appleSpeech', 'parakeetV3', 'whisperLargeV3Turbo', or 'whisperLargeV3'"};
+    }
+    return @{@"status": @"ok", @"engine": panel.transcriptionEngine};
 }
 
 static NSDictionary *SpliceKit_handleCaptionsGetStyles(NSDictionary *params) {
@@ -27831,6 +27852,8 @@ NSDictionary *SpliceKit_handleRequest(NSDictionary *request) {
         result = SpliceKit_handleCaptionsClose(params);
     } else if ([method isEqualToString:@"captions.getState"]) {
         result = SpliceKit_handleCaptionsGetState(params);
+    } else if ([method isEqualToString:@"captions.setEngine"]) {
+        result = SpliceKit_handleCaptionsSetEngine(params);
     } else if ([method isEqualToString:@"captions.getStyles"]) {
         result = SpliceKit_handleCaptionsGetStyles(params);
     } else if ([method isEqualToString:@"captions.setStyle"]) {

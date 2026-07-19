@@ -19,6 +19,10 @@
 
 			<h2>🐞 Bug Fixes</h2>
 			<ul>
+				<li>Adds Apple Speech as an on-device transcription engine in the social captions panel and API.</li>
+				<li>Fixes an Apple Speech diagnostics crash caused by constructing a URL recognition request without a URL.</li>
+				<li>Transcribes the exact trimmed timeline audio ranges with Apple Speech instead of repeatedly analyzing whole source files.</li>
+				<li>Prevents delayed persistence repair from rewriting freshly generated titles during FCP text-inspector rendering.</li>
 				<li>Crash fixes from Sentry triage: silences false-positive &#x27;FCP terminated shortly after launch&#x27; Sentry events on normal user quits.</li>
 				<li>Suppresses Xcode CLT prereq from crash dashboards.</li>
 				<li>Ships <code>whisper-transcriber</code> so the Whisper <code>large-v3</code> / <code>large-v3-turbo</code> engines in the social captions panel actually work.</li>

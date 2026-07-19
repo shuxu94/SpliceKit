@@ -83,10 +83,10 @@ caption system doesn't support.
 │  └──────────────────────┴────────────────────────┘           │
 │         │  Notification delegate                             │
 ├─────────┼───────────────────────────────────────────────────┤
-│  Transcript Panel (ObjC)                                    │
-│  SpliceKitTranscriptPanel.h/m                               │
-│  Parakeet/Apple Speech/FCP Native engines                   │
-│  Word-level timing extraction                                │
+│  Transcription                                               │
+│  Caption panel: Apple Speech/Parakeet/Whisper engines        │
+│  Transcript panel: Apple Speech/Parakeet/FCP Native engines  │
+│  Shared SpliceKitTranscriptWord timing model                 │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -1193,9 +1193,10 @@ Each tool maps to a `captions.*` JSON-RPC call.
 
 | MCP Tool | RPC Method | Purpose |
 |----------|-----------|---------|
-| `open_captions(file_url, style)` | `captions.open` | Open panel, start transcription |
+| `open_captions(file_url, style, engine)` | `captions.open` | Open panel, optionally select an engine, start transcription |
 | `close_captions()` | `captions.close` | Close the panel |
 | `get_caption_state()` | `captions.getState` | Status, words, segments, style |
+| `set_caption_engine(engine)` | `captions.setEngine` | Select Apple Speech, Parakeet, or Whisper |
 | `get_caption_styles()` | `captions.getStyles` | List all 12 presets |
 | `set_caption_style(preset_id, font, ...)` | `captions.setStyle` | Configure style |
 | `set_caption_grouping(mode, max_words, ...)` | `captions.setGrouping` | Configure segmentation |
@@ -1207,8 +1208,8 @@ Each tool maps to a `captions.*` JSON-RPC call.
 ### Example MCP usage flow
 
 ```python
-# 1. Open panel and transcribe
-open_captions(style="bold_pop")
+# 1. Open panel and transcribe with on-device Apple Speech
+open_captions(style="bold_pop", engine="appleSpeech")
 
 # 2. Wait for transcription
 get_caption_state()  # poll until status="ready"
