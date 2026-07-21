@@ -186,7 +186,7 @@ class TranscriptSilenceAccuracyTests(unittest.TestCase):
         self.assertIn("SpliceKit_handleFCPXMLExport", plan)
         self.assertIn('if ([enabled isEqualToString:@"0"]) continue', plan)
         self.assertIn("for (NSXMLElement *reference in references)", plan)
-        self.assertIn("sourcePlacementStart = topOffset + nestedOffset - topReferenceStart", plan)
+        self.assertIn("SpliceKitTranscript_syncReferencePlacement(", plan)
         self.assertIn("overlapStart = MAX(syncStart, sourcePlacementStart)", plan)
         self.assertIn("mappedTimelineStart = timelineStart + overlapStart - syncStart", plan)
         self.assertIn("fileStart = referenceStart - assetOrigin + overlapStart - sourcePlacementStart", plan)
@@ -208,7 +208,7 @@ class TranscriptSilenceAccuracyTests(unittest.TestCase):
         self.assertIn('![elementName isEqualToString:@"asset-clip"]', plan)
         self.assertIn('@"Silence removal does not yet support %@ timeline items"', plan)
         self.assertIn('nodesForXPath:@".//*[@lane]"', plan)
-        self.assertIn("reference.parent != topReference", plan)
+        self.assertIn("SpliceKitTranscript_syncReferencePlacement(", plan)
         self.assertIn("has no enabled, readable audio source", plan)
 
         detector = method_body(
@@ -256,6 +256,35 @@ class TranscriptSilenceAccuracyTests(unittest.TestCase):
         )
         self.assertIn('@"sequenceUID": sequenceUID', plan)
         self.assertIn('@"sequenceName": sequenceName', plan)
+
+    def test_sync_source_mapper_supports_spine_and_gap_nesting(self):
+        mapper = method_body(
+            self.panel,
+            "static BOOL SpliceKitTranscript_syncReferencePlacement",
+        )
+        self.assertIn('node.name isEqualToString:@"spine"', mapper)
+        self.assertIn('parent.name isEqualToString:@"spine"', mapper)
+        self.assertIn("sourcePlacementStart += nodeOffset - parentStart", mapper)
+        self.assertIn("connected = YES", mapper)
+        self.assertIn("node != syncClip", mapper)
+
+        plan = method_body(
+            self.panel,
+            "- (NSArray<NSDictionary *> *)audioClipInfosFromFCPXMLWithError:(NSString **)errorOut",
+        )
+        self.assertNotIn(
+            "Synchronized clip audio nesting is not supported by the exact source mapper",
+            plan,
+        )
+        self.assertNotIn("reference.parent != topReference", plan)
+
+        # FCP 11.1 regression fixture: sync-clip > spine > gap > external WAV.
+        # A child offset is in the gap's local timeline, so subtract gap.start.
+        gap_offset = 0.0
+        gap_start = 107999892 / 30000
+        wav_offset = 86400097 / 24000
+        source_placement_start = gap_offset + wav_offset - gap_start
+        self.assertAlmostEqual(source_placement_start, 0.007641666667, places=9)
 
     def test_persisted_audio_mask_is_not_destructive_after_restore(self):
         restore = method_body(
@@ -307,8 +336,8 @@ class TranscriptSilenceAccuracyTests(unittest.TestCase):
         )
         self.assertIn('SpliceKitTranscript_syncSourceAudioIsExplicitlyInactive(item, @"storyline")', plan)
         self.assertIn('SpliceKitTranscript_syncSourceAudioIsExplicitlyInactive(item, @"connected")', plan)
-        self.assertIn("reference == topReference && storylineAudioInactive", plan)
-        self.assertIn("reference != topReference && connectedAudioInactive", plan)
+        self.assertIn("!connectedReference && storylineAudioInactive", plan)
+        self.assertIn("connectedReference && connectedAudioInactive", plan)
         self.assertIn("skippedInactiveAudioRanges++", plan)
 
     def test_synced_external_source_coverage_uses_fcpxml_parent_time_domain(self):

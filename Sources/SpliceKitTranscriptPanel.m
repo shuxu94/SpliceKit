@@ -89,6 +89,73 @@ static BOOL SpliceKitTranscript_syncSourceAudioIsExplicitlyInactive(
     return foundRoleState && !foundEnabledActiveRole;
 }
 
+// Resolve an asset-clip's position in a synchronized clip's local timeline.
+// FCP can serialize synchronized media in either of these equivalent shapes:
+//
+//   sync-clip > asset-clip > asset-clip[lane]
+//   sync-clip > spine > gap > asset-clip[lane]
+//
+// `offset` is expressed in the parent's local timeline and `start` is that
+// parent's local origin. Walking to the sync-clip therefore generalizes the old
+// topOffset + nestedOffset - topStart calculation to both shapes (and to
+// additional valid story-container nesting).
+static BOOL SpliceKitTranscript_syncReferencePlacement(
+    NSXMLElement *syncClip,
+    NSXMLElement *reference,
+    double *placementOut,
+    BOOL *connectedOut,
+    NSString **errorOut) {
+    if (!syncClip || !reference) {
+        if (errorOut) *errorOut = @"Synchronized clip has no readable audio reference";
+        return NO;
+    }
+
+    double sourcePlacementStart = 0.0;
+    BOOL connected = NO;
+    NSXMLElement *node = reference;
+    while (node && node != syncClip) {
+        NSXMLNode *parentNode = node.parent;
+        if (![parentNode isKindOfClass:[NSXMLElement class]]) {
+            if (errorOut) *errorOut = @"Synchronized audio reference is outside the synchronized clip";
+            return NO;
+        }
+        NSXMLElement *parent = (NSXMLElement *)parentNode;
+
+        // A spine is a timeline container, not a scheduled story item. Its
+        // children are already positioned in the spine's parent time domain.
+        if ([node.name isEqualToString:@"spine"]) {
+            node = parent;
+            continue;
+        }
+
+        double nodeOffset = SpliceKitTranscript_secondsFromFCPXMLTime(
+            [[node attributeForName:@"offset"] stringValue]);
+        if (parent == syncClip || [parent.name isEqualToString:@"spine"]) {
+            sourcePlacementStart += nodeOffset;
+        } else {
+            NSString *parentStartValue = [[parent attributeForName:@"start"] stringValue];
+            double parentStart = parentStartValue.length > 0
+                ? SpliceKitTranscript_secondsFromFCPXMLTime(parentStartValue) : 0.0;
+            sourcePlacementStart += nodeOffset - parentStart;
+            // An asset nested below a primary story item is anchored/connected,
+            // even when older FCPXML omits an explicit lane attribute.
+            connected = YES;
+        }
+
+        NSString *lane = [[node attributeForName:@"lane"] stringValue];
+        if (lane.length > 0 && lane.integerValue != 0) connected = YES;
+        node = parent;
+    }
+
+    if (node != syncClip || !isfinite(sourcePlacementStart)) {
+        if (errorOut) *errorOut = @"Unable to map synchronized audio into the clip timeline";
+        return NO;
+    }
+    if (placementOut) *placementOut = sourcePlacementStart;
+    if (connectedOut) *connectedOut = connected;
+    return YES;
+}
+
 static NSArray<NSDictionary *> *SpliceKitTranscript_mergeTimeRanges(
     NSArray<NSDictionary *> *ranges, double gap) {
     NSArray *sorted = [ranges sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
@@ -3677,21 +3744,10 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
         } else {
             references = [item nodesForXPath:@".//asset-clip" error:nil];
         }
-        NSXMLElement *topReference = references.firstObject;
-        if (!topReference || ([elementName isEqualToString:@"sync-clip"] && topReference.parent != item)) {
-            if (errorOut) *errorOut = @"Synchronized clip audio nesting is not supported by the exact source mapper";
+        if (references.count == 0) {
+            if (errorOut) *errorOut = @"Synchronized clip has no readable audio reference";
             return nil;
         }
-        NSXMLElement *topAsset = topReference
-            ? assets[[[topReference attributeForName:@"ref"] stringValue]] : nil;
-        double topOrigin = SpliceKitTranscript_secondsFromFCPXMLTime(
-            [[topAsset attributeForName:@"start"] stringValue]);
-        double topOffset = SpliceKitTranscript_secondsFromFCPXMLTime(
-            [[topReference attributeForName:@"offset"] stringValue]);
-        NSString *topReferenceStartValue = [[topReference attributeForName:@"start"] stringValue];
-        double topReferenceStart = topReferenceStartValue.length > 0
-            ? SpliceKitTranscript_secondsFromFCPXMLTime(topReferenceStartValue)
-            : topOrigin;
         double syncStart = SpliceKitTranscript_secondsFromFCPXMLTime(
             [[item attributeForName:@"start"] stringValue]);
         BOOL synchronizedClip = [elementName isEqualToString:@"sync-clip"];
@@ -3706,17 +3762,21 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
         // each source's exact sync offset. Choosing only the first waveform was
         // the source of incorrect behavior on synchronized clips.
         for (NSXMLElement *reference in references) {
-            if (reference != topReference && reference.parent != topReference) {
-                if (errorOut) *errorOut = @"Synchronized audio nested more than one level is not supported";
+            BOOL connectedReference = NO;
+            double sourcePlacementStart = 0.0;
+            if (synchronizedClip &&
+                !SpliceKitTranscript_syncReferencePlacement(
+                    item, reference, &sourcePlacementStart, &connectedReference, errorOut)) {
                 return nil;
             }
-            // sourceID="storyline" describes the top reference. Its audio can
-            // be disabled independently of the asset-clip's enabled attribute.
-            if (reference == topReference && storylineAudioInactive) {
+            // sourceID="storyline" describes references on the synchronized
+            // clip's primary spine. Their audio can be disabled independently
+            // of the asset-clip's enabled attribute.
+            if (!connectedReference && storylineAudioInactive) {
                 skippedInactiveAudioRanges++;
                 continue;
             }
-            if (reference != topReference && connectedAudioInactive) {
+            if (connectedReference && connectedAudioInactive) {
                 skippedInactiveAudioRanges++;
                 continue;
             }
@@ -3724,7 +3784,7 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
             if ([enabled isEqualToString:@"0"]) continue;
             NSXMLElement *asset = assets[[[reference attributeForName:@"ref"] stringValue]];
             if (![[[asset attributeForName:@"hasAudio"] stringValue] boolValue]) continue;
-            if (reference != topReference &&
+            if (connectedReference &&
                 [[[asset attributeForName:@"hasVideo"] stringValue] boolValue]) {
                 if (errorOut) *errorOut = @"Connected video inside a synchronized clip is not an audio sync source";
                 return nil;
@@ -3751,20 +3811,6 @@ static double CMTimeToSeconds(SpliceKitTranscript_CMTime t) {
             double mappedTimelineStart = timelineStart;
             double mappedDuration = duration;
             if ([elementName isEqualToString:@"sync-clip"]) {
-                // Convert each source's placement into the synchronized clip's
-                // local time domain. A nested source's offset is expressed in
-                // the top asset-clip's local timeline, whose origin is
-                // topReferenceStart. The previous implementation added this
-                // displacement to syncStart; FCPXML requires subtracting it.
-                double sourcePlacementStart = topOffset;
-                if (reference == topReference) {
-                    sourcePlacementStart = topOffset;
-                } else {
-                    double nestedOffset = SpliceKitTranscript_secondsFromFCPXMLTime(
-                        [[reference attributeForName:@"offset"] stringValue]);
-                    sourcePlacementStart = topOffset + nestedOffset - topReferenceStart;
-                }
-
                 // A source may begin after the synchronized clip or end before
                 // it. Intersect coverage instead of clamping negative file time:
                 // clamping alone incorrectly maps source time zero to timeline
